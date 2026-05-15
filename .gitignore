@@ -9,8 +9,13 @@ kryos-mcp-pg.exe
 # Local config (never commit secrets)
 .env
 .env.*
+/grants.json
+grants.local.json
 grants.local.toml
 *.connstr
+
+# Audit logs
+*.audit.jsonl
 
 # Editor
 .vscode/

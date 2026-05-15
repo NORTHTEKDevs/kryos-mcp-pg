@@ -36,6 +36,7 @@ let mut LIMIT_MAX_QUERY_BYTES: i64 = 16384
 
 let mut TBL_NAMES: [str] = []
 let mut TBL_SCHEMAS: [str] = []
+let mut TBL_QUALIFIED: [str] = []
 let mut TBL_ACTIONS: [str] = []
 let mut TBL_COLUMNS: [str] = []
 let mut TBL_FILTERS: [str] = []
@@ -47,6 +48,10 @@ let mut SHAPE_ALLOW_WINDOW: i64 = 0
 
 let mut GRANTS_LOADED: i64 = 0
 let mut LOAD_ERROR: str = ""
+
+// v0.2: per-call audit log. When KRYOS_MCP_PG_AUDIT_LOG is set, every
+// tool_query/tool_explain/tool_dry_run call appends a JSONL line.
+let mut AUDIT_LOG_PATH: str = ""
 
 // ===========================================================================
 // String / collection helpers (Kryos lacks index_of / env_get_or builtins)
@@ -319,6 +324,7 @@ fn load_grants() -> i64 {
         sch = json_to_str(schema_n)
       }
       push(TBL_SCHEMAS, sch)
+      push(TBL_QUALIFIED, sch + "." + json_to_str(name_n))
 
       let actions_n: i64 = json_get(t, "actions")
       let mut actions_csv: str = ""
@@ -391,8 +397,46 @@ fn load_grants() -> i64 {
     }
   }
 
+  // v0.2: optional per-call audit log path.
+  AUDIT_LOG_PATH = env_or("KRYOS_MCP_PG_AUDIT_LOG", "")
+
   GRANTS_LOADED = 1
   return 1
+}
+
+// ===========================================================================
+// Audit log (v0.2)
+// ===========================================================================
+
+// Escape a string for inclusion as a JSON string literal value. Conservative:
+// escape backslash, quote, newline, carriage return, tab. Other control bytes
+// pass through (we expect SQL/text payloads only).
+fn json_escape(s: str) -> str {
+  let mut out: str = replace(s, "\\", "\\\\")
+  out = replace(out, "\"", "\\\"")
+  out = replace(out, "\n", "\\n")
+  out = replace(out, "\r", "\\r")
+  out = replace(out, "\t", "\\t")
+  return out
+}
+
+@capabilities(io, time)
+fn audit(tool: str, sql: str, verdict: str, reason: str) {
+  if len(AUDIT_LOG_PATH) == 0 {
+    return
+  }
+  // Kryos string literals treat { and } as f-string brace markers, so build
+  // the leading "{" and trailing "}" via char_from to avoid lexer interpretation.
+  let lbrace: str = char_from(123)
+  let rbrace: str = char_from(125)
+  let ts: i64 = time_now()
+  let mut line: str = lbrace + "\"ts\":" + to_string(ts)
+  line = line + ",\"tool\":\"" + json_escape(tool) + "\""
+  line = line + ",\"verdict\":\"" + json_escape(verdict) + "\""
+  line = line + ",\"reason\":\"" + json_escape(reason) + "\""
+  line = line + ",\"sql\":\"" + json_escape(sql) + "\""
+  line = line + rbrace + "\n"
+  append_file(AUDIT_LOG_PATH, line)
 }
 
 // ===========================================================================
@@ -437,35 +481,32 @@ fn classify_action(sql_lower: str) -> str {
 }
 
 // Returns the granted-table names referenced by `sql_lower` (already padded
-// with leading + trailing space).
+// with leading + trailing space). Returns qualified names (schema.table).
+// v0.2: bare references match only when the grant entry's schema is "public".
 fn referenced_tables(sql_lower: str) -> [str] {
   let found: [str] = []
   let mut i: i64 = 0
-  while i < len(TBL_NAMES) {
-    let name: str = TBL_NAMES[i]
-    let pad_space: str = " " + name + " "
-    let pad_comma: str = " " + name + ","
-    let pad_paren: str = " " + name + "("
-    let pad_semi: str = " " + name + ";"
-    let pad_tail: str = " " + name
+  while i < len(TBL_QUALIFIED) {
+    let qname: str = TBL_QUALIFIED[i]
+    let bname: str = TBL_NAMES[i]
     let mut hit: i64 = 0
-    if contains(sql_lower, pad_space) {
-      hit = 1
-    }
-    if contains(sql_lower, pad_comma) {
-      hit = 1
-    }
-    if contains(sql_lower, pad_paren) {
-      hit = 1
-    }
-    if contains(sql_lower, pad_semi) {
-      hit = 1
-    }
-    if ends_with(sql_lower, pad_tail) {
-      hit = 1
+    // Qualified-form patterns (schema.table) — always checked.
+    if contains(sql_lower, " " + qname + " ") { hit = 1 }
+    if contains(sql_lower, " " + qname + ",") { hit = 1 }
+    if contains(sql_lower, " " + qname + "(") { hit = 1 }
+    if contains(sql_lower, " " + qname + ";") { hit = 1 }
+    if ends_with(sql_lower, " " + qname) { hit = 1 }
+    // Bare-name patterns — only meaningful when the grant is in "public".
+    // A grant like `analytics.events` does NOT match bare `events` references.
+    if TBL_SCHEMAS[i] == "public" {
+      if contains(sql_lower, " " + bname + " ") { hit = 1 }
+      if contains(sql_lower, " " + bname + ",") { hit = 1 }
+      if contains(sql_lower, " " + bname + "(") { hit = 1 }
+      if contains(sql_lower, " " + bname + ";") { hit = 1 }
+      if ends_with(sql_lower, " " + bname) { hit = 1 }
     }
     if hit == 1 {
-      push(found, name)
+      push(found, qname)
     }
     i = i + 1
   }
@@ -514,13 +555,13 @@ fn has_ungranted_table(sql_lower: str) -> i64 {
         j = j + 1
       }
       let ident: str = substr(sql_lower, after, j)
-      let dot: i64 = find_sub(ident, ".", 0)
-      let mut table: str = ident
-      if dot >= 0 {
-        table = substr(ident, dot + 1, len(ident))
-      }
-      if len(table) > 0 {
-        if arr_contains(TBL_NAMES, table) == 0 {
+      if len(ident) > 0 {
+        let dot: i64 = find_sub(ident, ".", 0)
+        let mut qualified: str = ident
+        if dot < 0 {
+          qualified = "public." + ident
+        }
+        if arr_contains(TBL_QUALIFIED, qualified) == 0 {
           return 1
         }
       }
@@ -571,11 +612,11 @@ fn validate_sql(sql: str) -> str {
     }
     let mut i: i64 = 0
     while i < len(refs) {
-      let name: str = refs[i]
+      let qname: str = refs[i]
       let mut j: i64 = 0
       let mut ok: i64 = 0
-      while j < len(TBL_NAMES) {
-        if TBL_NAMES[j] == name {
+      while j < len(TBL_QUALIFIED) {
+        if TBL_QUALIFIED[j] == qname {
           if csv_contains(TBL_ACTIONS[j], action) == 1 {
             ok = 1
           }
@@ -584,7 +625,7 @@ fn validate_sql(sql: str) -> str {
         j = j + 1
       }
       if ok == 0 {
-        return "table '" + name + "' not granted action '" + action + "'"
+        return "table '" + qname + "' not granted action '" + action + "'"
       }
       i = i + 1
     }
@@ -709,8 +750,10 @@ fn tool_query(args_node: i64) -> i64 {
   let sql: str = json_to_str(sql_n)
   let refusal: str = validate_sql(sql)
   if len(refusal) > 0 {
+    audit("query", sql, "refused", refusal)
     return err_content("REFUSED by grants: " + refusal)
   }
+  audit("query", sql, "allowed", "")
   let params_n: i64 = json_get(args_node, "params")
   let resp: i64 = neon_query(sql, params_n)
   return text_content(format_response(resp))
@@ -727,8 +770,10 @@ fn tool_explain(args_node: i64) -> i64 {
   let sql: str = json_to_str(sql_n)
   let refusal: str = validate_sql(sql)
   if len(refusal) > 0 {
+    audit("explain", sql, "refused", refusal)
     return err_content("REFUSED by grants: " + refusal)
   }
+  audit("explain", sql, "allowed", "")
   let wrapped: str = "EXPLAIN " + sql
   let resp: i64 = neon_query(wrapped, 0)
   return text_content(format_response(resp))
@@ -745,11 +790,13 @@ fn tool_dry_run(args_node: i64) -> i64 {
   let sql: str = json_to_str(sql_n)
   let refusal: str = validate_sql(sql)
   if len(refusal) > 0 {
+    audit("dry_run", sql, "refused", refusal)
     return text_content("WOULD REFUSE: " + refusal)
   }
   let lower: str = to_lower(sql)
   let padded: str = " " + lower + " "
   let refs: [str] = referenced_tables(padded)
+  audit("dry_run", sql, "allowed", "")
   return text_content("WOULD ALLOW. action=" + classify_action(lower) + ", tables_referenced=[" + join_csv(refs) + "]")
 }
 
@@ -776,11 +823,26 @@ fn tool_schema(args_node: i64) -> i64 {
   if name_n <= 0 {
     return err_content("missing 'table' argument")
   }
-  let table: str = json_to_str(name_n)
-  if arr_contains(TBL_NAMES, table) == 0 {
-    return err_content("table '" + table + "' is not in grants. " + grant_table_summary())
+  let raw: str = json_to_str(name_n)
+  // Resolve like a SQL reference: bare names default to "public" schema.
+  let dot: i64 = find_sub(raw, ".", 0)
+  let mut qualified: str = raw
+  if dot < 0 {
+    qualified = "public." + raw
   }
-  let sql: str = "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '" + table + "' ORDER BY ordinal_position"
+  if arr_contains(TBL_QUALIFIED, qualified) == 0 {
+    return err_content("table '" + qualified + "' is not in grants. " + grant_table_summary())
+  }
+  // Use the bare name in the information_schema lookup; pass schema separately.
+  let mut bare: str = raw
+  if dot >= 0 {
+    bare = substr(raw, dot + 1, len(raw))
+  }
+  let mut schema_part: str = "public"
+  if dot >= 0 {
+    schema_part = substr(raw, 0, dot)
+  }
+  let sql: str = "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = '" + schema_part + "' AND table_name = '" + bare + "' ORDER BY ordinal_position"
   let resp: i64 = neon_query(sql, 0)
   return text_content(format_response(resp))
 }
@@ -953,13 +1015,16 @@ fn handle_message(line: str) -> str {
 // Main
 // ===========================================================================
 
-@capabilities(net, env, io)
+@capabilities(net, env, io, time)
 fn main() {
   let ok: i64 = load_grants()
   if ok == 0 {
     eprintln("[kryos-mcp-pg] startup: " + LOAD_ERROR)
   } else {
     eprintln("[kryos-mcp-pg] grants loaded: " + to_string(len(TBL_NAMES)) + " tables, host=" + CONN_HOST)
+    if len(AUDIT_LOG_PATH) > 0 {
+      eprintln("[kryos-mcp-pg] audit log: " + AUDIT_LOG_PATH)
+    }
   }
 
   while SHUTDOWN == 0 {

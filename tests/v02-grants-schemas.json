@@ -1,0 +1,22 @@
+{
+  "_comment": "Multi-schema grants for v0.2 schema-qualified matching tests.",
+  "connection": { "url_env": "DATABASE_URL" },
+  "limits": { "statement_timeout_ms": 5000, "max_rows": 1000, "max_query_bytes": 16384 },
+  "tables": [
+    {
+      "name": "users",
+      "schema": "public",
+      "actions": ["read"],
+      "columns": ["id", "email"],
+      "filter": "deleted_at IS NULL"
+    },
+    {
+      "name": "events",
+      "schema": "analytics",
+      "actions": ["read"],
+      "columns": ["id", "user_id", "kind"]
+    }
+  ],
+  "ddl": { "allowed": false },
+  "shape": { "deny_select_star": true, "require_where_on_writes": true, "allow_window": false }
+}

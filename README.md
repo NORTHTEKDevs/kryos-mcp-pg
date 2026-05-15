@@ -78,28 +78,26 @@ DATABASE_URL=postgresql://user:pass@ep-foo-bar.region.aws.neon.tech/db \
   kryos run src/main.kry
 ```
 
-Or build a release binary:
-
-```bash
-kryos build --release
-DATABASE_URL=... KRYOS_MCP_PG_GRANTS=./grants.json ./kryos-mcp-pg
-```
+> **v0.1 note:** `kryos build --release` (LLVM AOT) currently fails because the Kryos 1.0 LLVM backend is missing JSON / `http_request` builtins that the Cranelift backend has. Use `kryos run` until upstream lands those bindings — the Cranelift JIT is fast enough for production MCP usage. Tracked in [ROADMAP.md](docs/ROADMAP.md).
 
 ### Claude Desktop config
 
 ```json
 {
   "mcpServers": {
-    "kryos-pg": {
-      "command": "/path/to/kryos-mcp-pg",
+    "pg": {
+      "command": "kryos",
+      "args": ["run", "/abs/path/to/kryos-mcp-pg/src/main.kry"],
       "env": {
         "DATABASE_URL": "postgresql://...",
-        "KRYOS_MCP_PG_GRANTS": "/path/to/grants.json"
+        "KRYOS_MCP_PG_GRANTS": "/abs/path/to/grants.json"
       }
     }
   }
 }
 ```
+
+See [`examples/claude-desktop-config.json`](examples/claude-desktop-config.json) for a copy-pasteable version.
 
 ---
 
@@ -167,6 +165,24 @@ The Kryos `@capabilities(net, env, io)` annotation on `main()` means the compile
 The runtime grant check fires *before* any SQL hits the network. The Postgres role is the last line of defense, not the first.
 
 ---
+
+## Audit log (v0.2-dev)
+
+When `KRYOS_MCP_PG_AUDIT_LOG=/path/to/audit.jsonl` is set, every `query` / `explain` / `dry_run` call appends a JSONL line:
+
+```json
+{"ts":1747259820,"tool":"dry_run","verdict":"refused","reason":"DDL refused: ddl.allowed = false in grants","sql":"DROP TABLE users"}
+```
+
+Allowed and refused calls both get logged. Unset to disable. (See [docs/ROADMAP.md](docs/ROADMAP.md) for what's landed on `v0.2-dev`.)
+
+## Tests
+
+```bash
+bash tests/run_tests.sh
+```
+
+32 assertions covering all 7 README scenarios + 9 edge cases (joins onto ungranted tables, UPDATE on read-only tables, window functions, EXPLAIN classification, lowercase SQL, unknown actions like `VACUUM`) + tool-level error handling. Uses the `dry_run` tool throughout — no Neon round-trips, no DB needed. The fake `DATABASE_URL` in the script never connects.
 
 ## Limitations (v0.1)
 
