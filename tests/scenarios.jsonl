@@ -1,0 +1,22 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"grants","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tables","arguments":{}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT id, email FROM users WHERE deleted_at IS NULL"}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT * FROM users"}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"DELETE FROM users"}}}
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT id FROM secrets"}}}
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"DROP TABLE users"}}}
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"INSERT INTO audit_log (event) VALUES ('x')"}}}
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT name FROM audit_log"}}}
+{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"UPDATE orders SET status='paid' WHERE id=1"}}}
+{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"UPDATE orders SET status='paid'"}}}
+{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT u.id FROM users u JOIN secrets s ON u.id=s.user_id WHERE u.deleted_at IS NULL"}}}
+{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT id, RANK() OVER (ORDER BY id) FROM orders WHERE id > 0"}}}
+{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"EXPLAIN SELECT id FROM orders WHERE id = 1"}}}
+{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"VACUUM users"}}}
+{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"DELETE FROM users WHERE id=1"}}}
+{"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"INSERT INTO secrets (k) VALUES ('x')"}}}
+{"jsonrpc":"2.0","id":28,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"select id from orders where id=1"}}}
+{"jsonrpc":"2.0","id":29,"method":"tools/call","params":{"name":"schema","arguments":{}}}
+{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"query","arguments":{}}}

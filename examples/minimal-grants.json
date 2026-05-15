@@ -1,0 +1,26 @@
+{
+  "_comment": "Smallest useful grants file. Single read-only table, no writes, no DDL.",
+
+  "connection": { "url_env": "DATABASE_URL" },
+
+  "limits": {
+    "statement_timeout_ms": 5000,
+    "max_rows": 100,
+    "max_query_bytes": 8192
+  },
+
+  "tables": [
+    {
+      "name": "users",
+      "actions": ["read"],
+      "columns": ["id", "email", "name"]
+    }
+  ],
+
+  "ddl": { "allowed": false },
+  "shape": {
+    "deny_select_star": true,
+    "require_where_on_writes": true,
+    "allow_window": false
+  }
+}

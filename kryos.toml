@@ -1,0 +1,21 @@
+[package]
+name        = "kryos-mcp-pg"
+version     = "0.1.0"
+edition     = "2026"
+description = "Capability-gated Postgres MCP server, written in Kryos. Per-table grants enforced before SQL hits the wire."
+authors     = ["Northtek <info@northtek.io>"]
+license     = "MIT"
+repository  = "https://github.com/NORTHTEKDevs/kryos-mcp-pg"
+homepage    = "https://northtek.io"
+keywords    = ["mcp", "postgres", "neon", "capability", "claude"]
+
+[capabilities]
+net = true
+io  = true
+env = true
+
+[build]
+entry  = "src/main.kry"
+output = "kryos-mcp-pg"
+strip  = true
+opt    = "release"

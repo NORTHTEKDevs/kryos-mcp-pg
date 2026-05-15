@@ -1,0 +1,19 @@
+# Kryos build artifacts
+target/
+.kryos/
+kryos.lock
+*.kryc
+kryos-mcp-pg
+kryos-mcp-pg.exe
+
+# Local config (never commit secrets)
+.env
+.env.*
+grants.local.toml
+*.connstr
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store

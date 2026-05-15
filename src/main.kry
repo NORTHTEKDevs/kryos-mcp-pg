@@ -1,0 +1,975 @@
+// kryos-mcp-pg — Capability-gated Postgres MCP server in pure Kryos.
+//
+// Speaks JSON-RPC 2.0 over stdio per the MCP spec. Postgres execution is
+// done via Neon's HTTP serverless endpoint (POST /sql), so it works with
+// any Neon database without a wire-protocol implementation.
+//
+// Per-table grants are loaded from a JSON config file at startup and
+// every SQL statement is validated against them BEFORE the request hits
+// the network. If a grant doesn't permit it, the tool call returns an
+// error and nothing reaches Postgres.
+//
+// Tools exposed:
+//   - query(sql, params?)        -> rows from a SELECT (read action)
+//   - tables()                   -> list of granted tables (no SQL sent)
+//   - schema(table)              -> column list for a granted table
+//   - explain(sql)               -> EXPLAIN for a granted query
+//   - dry_run(sql)               -> validate without executing
+//   - grants()                   -> dump active grant config
+//
+// Run as a real MCP server:
+//   DATABASE_URL=postgresql://... \
+//     KRYOS_MCP_PG_GRANTS=./grants.json \
+//     kryos run src/main.kry
+
+// ===========================================================================
+// State
+// ===========================================================================
+
+let mut SHUTDOWN: i64 = 0
+
+let mut CONN_URL: str = ""
+let mut CONN_HOST: str = ""
+let mut LIMIT_TIMEOUT_MS: i64 = 5000
+let mut LIMIT_MAX_ROWS: i64 = 1000
+let mut LIMIT_MAX_QUERY_BYTES: i64 = 16384
+
+let mut TBL_NAMES: [str] = []
+let mut TBL_SCHEMAS: [str] = []
+let mut TBL_ACTIONS: [str] = []
+let mut TBL_COLUMNS: [str] = []
+let mut TBL_FILTERS: [str] = []
+
+let mut DDL_ALLOWED: i64 = 0
+let mut SHAPE_DENY_SELECT_STAR: i64 = 1
+let mut SHAPE_REQUIRE_WHERE_ON_WRITES: i64 = 1
+let mut SHAPE_ALLOW_WINDOW: i64 = 0
+
+let mut GRANTS_LOADED: i64 = 0
+let mut LOAD_ERROR: str = ""
+
+// ===========================================================================
+// String / collection helpers (Kryos lacks index_of / env_get_or builtins)
+// ===========================================================================
+
+fn env_or(name: str, default: str) -> str {
+  let v: str = env_get(name)
+  if len(v) == 0 {
+    return default
+  }
+  return v
+}
+
+fn ch(s: str, i: i64) -> str {
+  return substr(s, i, i + 1)
+}
+
+fn find_sub(haystack: str, needle: str, start: i64) -> i64 {
+  let nh: i64 = len(haystack)
+  let nn: i64 = len(needle)
+  if nn == 0 {
+    return start
+  }
+  if start < 0 {
+    return -1
+  }
+  let last: i64 = nh - nn
+  let mut i: i64 = start
+  while i <= last {
+    if substr(haystack, i, i + nn) == needle {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn arr_contains(arr: [str], needle: str) -> i64 {
+  let mut i: i64 = 0
+  while i < len(arr) {
+    if arr[i] == needle {
+      return 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn csv_contains(csv: str, needle: str) -> i64 {
+  let parts: [str] = split(csv, ",")
+  return arr_contains(parts, needle)
+}
+
+fn join_csv(arr: [str]) -> str {
+  let mut out: str = ""
+  let mut i: i64 = 0
+  while i < len(arr) {
+    if len(out) == 0 {
+      out = arr[i]
+    } else {
+      out = out + "," + arr[i]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// JSON node truthiness: handles both bool (true/false) and number (1/0) forms.
+fn json_truthy(node: i64) -> i64 {
+  if node <= 0 {
+    return 0
+  }
+  let f: f64 = json_to_float(node)
+  if f != 0.0 {
+    return 1
+  }
+  let s: str = json_to_str(node)
+  if s == "true" {
+    return 1
+  }
+  if s == "1" {
+    return 1
+  }
+  if s == "yes" {
+    return 1
+  }
+  return 0
+}
+
+// ===========================================================================
+// MCP response builders
+// ===========================================================================
+
+fn make_error(id: i64, code: i64, message: str) -> str {
+  let resp: i64 = json_object(
+    ["jsonrpc", "id", "error"],
+    [
+      json_string("2.0"),
+      json_number(id as f64),
+      json_object(
+        ["code", "message"],
+        [json_number(code as f64), json_string(message)]
+      )
+    ]
+  )
+  return json_stringify(resp)
+}
+
+fn make_result(id: i64, result_node: i64) -> str {
+  let resp: i64 = json_object(
+    ["jsonrpc", "id", "result"],
+    [json_string("2.0"), json_number(id as f64), result_node]
+  )
+  return json_stringify(resp)
+}
+
+fn text_content(text: str) -> i64 {
+  let item: i64 = json_object(
+    ["type", "text"],
+    [json_string("text"), json_string(text)]
+  )
+  return json_object(["content"], [json_array([item])])
+}
+
+fn err_content(message: str) -> i64 {
+  let item: i64 = json_object(
+    ["type", "text"],
+    [json_string("text"), json_string("[kryos-mcp-pg] " + message)]
+  )
+  return json_object(
+    ["content", "isError"],
+    [json_array([item]), json_bool(true)]
+  )
+}
+
+// ===========================================================================
+// Postgres connection-string parsing — extract the host for Neon's HTTPS URL
+// ===========================================================================
+
+fn parse_host(url: str) -> str {
+  let mut start: i64 = 0
+  if starts_with(url, "postgresql://") {
+    start = 13
+  } elif starts_with(url, "postgres://") {
+    start = 11
+  } else {
+    return ""
+  }
+  // Skip optional user:pass@
+  let mut at_idx: i64 = -1
+  let mut i: i64 = start
+  let n: i64 = len(url)
+  while i < n {
+    let c: str = ch(url, i)
+    if c == "@" {
+      at_idx = i
+    }
+    if c == "/" {
+      break
+    }
+    i = i + 1
+  }
+  let mut host_start: i64 = start
+  if at_idx >= 0 {
+    host_start = at_idx + 1
+  }
+  // Host ends at next "/" "?" or ":"
+  let mut j: i64 = host_start
+  while j < n {
+    let c: str = ch(url, j)
+    if c == "/" {
+      break
+    }
+    if c == "?" {
+      break
+    }
+    if c == ":" {
+      break
+    }
+    j = j + 1
+  }
+  return substr(url, host_start, j)
+}
+
+// ===========================================================================
+// Grant loading
+// ===========================================================================
+
+fn grant_table_summary() -> str {
+  let mut out: str = ""
+  let mut i: i64 = 0
+  while i < len(TBL_NAMES) {
+    let entry: str = TBL_SCHEMAS[i] + "." + TBL_NAMES[i] + " [" + TBL_ACTIONS[i] + "]"
+    if len(out) == 0 {
+      out = entry
+    } else {
+      out = out + ", " + entry
+    }
+    i = i + 1
+  }
+  return out
+}
+
+@capabilities(io, env)
+fn load_grants() -> i64 {
+  let path: str = env_or("KRYOS_MCP_PG_GRANTS", "grants.json")
+  if file_exists(path) == 0 {
+    LOAD_ERROR = "grants file not found: " + path
+    return 0
+  }
+  let raw: str = file_read(path)
+  let cfg: i64 = json_parse(raw)
+  if cfg <= 0 {
+    LOAD_ERROR = "grants file is not valid JSON: " + path
+    return 0
+  }
+
+  let conn_n: i64 = json_get(cfg, "connection")
+  let mut url_env: str = "DATABASE_URL"
+  if conn_n > 0 {
+    let ue_n: i64 = json_get(conn_n, "url_env")
+    if ue_n > 0 {
+      url_env = json_to_str(ue_n)
+    }
+  }
+  let url: str = env_or(url_env, "")
+  if len(url) == 0 {
+    LOAD_ERROR = "env var " + url_env + " is not set"
+    return 0
+  }
+  CONN_URL = url
+  CONN_HOST = parse_host(url)
+  if len(CONN_HOST) == 0 {
+    LOAD_ERROR = "could not parse host from connection URL"
+    return 0
+  }
+
+  let limits_n: i64 = json_get(cfg, "limits")
+  if limits_n > 0 {
+    let t_n: i64 = json_get(limits_n, "statement_timeout_ms")
+    if t_n > 0 {
+      LIMIT_TIMEOUT_MS = json_to_float(t_n) as i64
+    }
+    let r_n: i64 = json_get(limits_n, "max_rows")
+    if r_n > 0 {
+      LIMIT_MAX_ROWS = json_to_float(r_n) as i64
+    }
+    let q_n: i64 = json_get(limits_n, "max_query_bytes")
+    if q_n > 0 {
+      LIMIT_MAX_QUERY_BYTES = json_to_float(q_n) as i64
+    }
+  }
+
+  let tables_n: i64 = json_get(cfg, "tables")
+  if tables_n > 0 {
+    let count: i64 = json_length(tables_n)
+    let mut i: i64 = 0
+    while i < count {
+      let t: i64 = json_get_index(tables_n, i)
+      let name_n: i64 = json_get(t, "name")
+      if name_n <= 0 {
+        i = i + 1
+        continue
+      }
+      push(TBL_NAMES, json_to_str(name_n))
+
+      let schema_n: i64 = json_get(t, "schema")
+      let mut sch: str = "public"
+      if schema_n > 0 {
+        sch = json_to_str(schema_n)
+      }
+      push(TBL_SCHEMAS, sch)
+
+      let actions_n: i64 = json_get(t, "actions")
+      let mut actions_csv: str = ""
+      if actions_n > 0 {
+        let ac: i64 = json_length(actions_n)
+        let mut k: i64 = 0
+        while k < ac {
+          let a: str = json_to_str(json_get_index(actions_n, k))
+          if len(actions_csv) == 0 {
+            actions_csv = a
+          } else {
+            actions_csv = actions_csv + "," + a
+          }
+          k = k + 1
+        }
+      }
+      push(TBL_ACTIONS, actions_csv)
+
+      let cols_n: i64 = json_get(t, "columns")
+      let mut cols_csv: str = "*"
+      if cols_n > 0 {
+        let cc: i64 = json_length(cols_n)
+        let mut tmp: str = ""
+        let mut k2: i64 = 0
+        while k2 < cc {
+          let c: str = json_to_str(json_get_index(cols_n, k2))
+          if len(tmp) == 0 {
+            tmp = c
+          } else {
+            tmp = tmp + "," + c
+          }
+          k2 = k2 + 1
+        }
+        if len(tmp) > 0 {
+          cols_csv = tmp
+        }
+      }
+      push(TBL_COLUMNS, cols_csv)
+
+      let filt_n: i64 = json_get(t, "filter")
+      let mut flt: str = ""
+      if filt_n > 0 {
+        flt = json_to_str(filt_n)
+      }
+      push(TBL_FILTERS, flt)
+
+      i = i + 1
+    }
+  }
+
+  let ddl_n: i64 = json_get(cfg, "ddl")
+  if ddl_n > 0 {
+    let allowed_n: i64 = json_get(ddl_n, "allowed")
+    DDL_ALLOWED = json_truthy(allowed_n)
+  }
+
+  let shape_n: i64 = json_get(cfg, "shape")
+  if shape_n > 0 {
+    let s1: i64 = json_get(shape_n, "deny_select_star")
+    if s1 > 0 {
+      SHAPE_DENY_SELECT_STAR = json_truthy(s1)
+    }
+    let s2: i64 = json_get(shape_n, "require_where_on_writes")
+    if s2 > 0 {
+      SHAPE_REQUIRE_WHERE_ON_WRITES = json_truthy(s2)
+    }
+    let s3: i64 = json_get(shape_n, "allow_window")
+    if s3 > 0 {
+      SHAPE_ALLOW_WINDOW = json_truthy(s3)
+    }
+  }
+
+  GRANTS_LOADED = 1
+  return 1
+}
+
+// ===========================================================================
+// SQL inspection — coarse but useful
+// ===========================================================================
+
+fn classify_action(sql_lower: str) -> str {
+  if starts_with(sql_lower, "select ") {
+    return "read"
+  }
+  if starts_with(sql_lower, "with ") {
+    return "read"
+  }
+  if starts_with(sql_lower, "explain ") {
+    return "read"
+  }
+  if starts_with(sql_lower, "insert ") {
+    return "write"
+  }
+  if starts_with(sql_lower, "update ") {
+    return "write"
+  }
+  if starts_with(sql_lower, "delete ") {
+    return "write"
+  }
+  if starts_with(sql_lower, "merge ") {
+    return "write"
+  }
+  if starts_with(sql_lower, "create ") {
+    return "ddl"
+  }
+  if starts_with(sql_lower, "alter ") {
+    return "ddl"
+  }
+  if starts_with(sql_lower, "drop ") {
+    return "ddl"
+  }
+  if starts_with(sql_lower, "truncate ") {
+    return "ddl"
+  }
+  return "unknown"
+}
+
+// Returns the granted-table names referenced by `sql_lower` (already padded
+// with leading + trailing space).
+fn referenced_tables(sql_lower: str) -> [str] {
+  let found: [str] = []
+  let mut i: i64 = 0
+  while i < len(TBL_NAMES) {
+    let name: str = TBL_NAMES[i]
+    let pad_space: str = " " + name + " "
+    let pad_comma: str = " " + name + ","
+    let pad_paren: str = " " + name + "("
+    let pad_semi: str = " " + name + ";"
+    let pad_tail: str = " " + name
+    let mut hit: i64 = 0
+    if contains(sql_lower, pad_space) {
+      hit = 1
+    }
+    if contains(sql_lower, pad_comma) {
+      hit = 1
+    }
+    if contains(sql_lower, pad_paren) {
+      hit = 1
+    }
+    if contains(sql_lower, pad_semi) {
+      hit = 1
+    }
+    if ends_with(sql_lower, pad_tail) {
+      hit = 1
+    }
+    if hit == 1 {
+      push(found, name)
+    }
+    i = i + 1
+  }
+  return found
+}
+
+// Look for "from <ident>" / "join <ident>" / "into <ident>" / "update <ident>"
+// / "table <ident>" and refuse if the identifier is not in TBL_NAMES.
+fn has_ungranted_table(sql_lower: str) -> i64 {
+  let prefixes: [str] = ["from ", "join ", "into ", "update ", "table "]
+  let mut p: i64 = 0
+  while p < len(prefixes) {
+    let prefix: str = prefixes[p]
+    let mut start: i64 = 0
+    let nl: i64 = len(sql_lower)
+    while start >= 0 and start < nl {
+      let idx: i64 = find_sub(sql_lower, prefix, start)
+      if idx < 0 {
+        break
+      }
+      let after: i64 = idx + len(prefix)
+      let mut j: i64 = after
+      while j < nl {
+        let c: str = ch(sql_lower, j)
+        if c == " " {
+          break
+        }
+        if c == "," {
+          break
+        }
+        if c == ";" {
+          break
+        }
+        if c == "(" {
+          break
+        }
+        if c == ")" {
+          break
+        }
+        if c == "\n" {
+          break
+        }
+        if c == "\t" {
+          break
+        }
+        j = j + 1
+      }
+      let ident: str = substr(sql_lower, after, j)
+      let dot: i64 = find_sub(ident, ".", 0)
+      let mut table: str = ident
+      if dot >= 0 {
+        table = substr(ident, dot + 1, len(ident))
+      }
+      if len(table) > 0 {
+        if arr_contains(TBL_NAMES, table) == 0 {
+          return 1
+        }
+      }
+      start = j
+    }
+    p = p + 1
+  }
+  return 0
+}
+
+// Validate a SQL statement against grants.
+// Returns "" on pass, or a refusal reason on fail.
+fn validate_sql(sql: str) -> str {
+  if len(sql) > LIMIT_MAX_QUERY_BYTES {
+    return "query exceeds max_query_bytes (" + to_string(LIMIT_MAX_QUERY_BYTES) + ")"
+  }
+  let lower: str = to_lower(sql)
+  let padded: str = " " + lower + " "
+  let action: str = classify_action(lower)
+  if action == "unknown" {
+    return "could not classify SQL action; refused. Allowed leading keywords: select, with, explain, insert, update, delete, merge, create, alter, drop, truncate."
+  }
+  if action == "ddl" and DDL_ALLOWED == 0 {
+    return "DDL refused: ddl.allowed = false in grants"
+  }
+  if SHAPE_DENY_SELECT_STAR == 1 and contains(padded, "select *") {
+    return "SELECT * refused: shape.deny_select_star = true. Use explicit columns."
+  }
+  if action == "write" and SHAPE_REQUIRE_WHERE_ON_WRITES == 1 {
+    let is_upd: bool = starts_with(lower, "update ")
+    let is_del: bool = starts_with(lower, "delete ")
+    let has_where: bool = contains(padded, " where ")
+    if (is_upd or is_del) and has_where == false {
+      return "UPDATE/DELETE without WHERE refused: shape.require_where_on_writes = true"
+    }
+  }
+  if SHAPE_ALLOW_WINDOW == 0 and contains(padded, " over (") {
+    return "window functions refused: shape.allow_window = false"
+  }
+
+  let refs: [str] = referenced_tables(padded)
+  if action != "ddl" {
+    if has_ungranted_table(padded) == 1 {
+      return "query references a table not in grants. Listed tables: " + grant_table_summary()
+    }
+    if len(refs) == 0 {
+      return "no granted table referenced. Listed tables: " + grant_table_summary()
+    }
+    let mut i: i64 = 0
+    while i < len(refs) {
+      let name: str = refs[i]
+      let mut j: i64 = 0
+      let mut ok: i64 = 0
+      while j < len(TBL_NAMES) {
+        if TBL_NAMES[j] == name {
+          if csv_contains(TBL_ACTIONS[j], action) == 1 {
+            ok = 1
+          }
+          break
+        }
+        j = j + 1
+      }
+      if ok == 0 {
+        return "table '" + name + "' not granted action '" + action + "'"
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+// ===========================================================================
+// Neon HTTP execution
+// ===========================================================================
+
+@capabilities(net)
+fn neon_query(sql: str, params_node: i64) -> i64 {
+  let url: str = "https://" + CONN_HOST + "/sql"
+  let mut params: i64 = json_array([])
+  if params_node > 0 {
+    params = params_node
+  }
+  let body_node: i64 = json_object(
+    ["query", "params"],
+    [json_string(sql), params]
+  )
+  let body: str = json_stringify(body_node)
+  let headers: str = "Content-Type: application/json\r\nNeon-Connection-String: " + CONN_URL + "\r\nNeon-Raw-Text-Output: true\r\nNeon-Array-Mode: true"
+  return http_request("POST", url, headers, body, LIMIT_TIMEOUT_MS + 10000)
+}
+
+fn format_response(resp: i64) -> str {
+  if resp <= 0 {
+    return "request to Neon failed (no response)"
+  }
+  let status_n: i64 = json_get(resp, "status")
+  let status: i64 = json_to_float(status_n) as i64
+  let body_n: i64 = json_get(resp, "body")
+  let mut body: str = ""
+  if body_n > 0 {
+    body = json_to_str(body_n)
+  }
+  if status != 200 {
+    return "Neon HTTP " + to_string(status) + ": " + body
+  }
+  let parsed: i64 = json_parse(body)
+  if parsed <= 0 {
+    return "Neon returned non-JSON body: " + body
+  }
+
+  let cmd_n: i64 = json_get(parsed, "command")
+  let mut cmd: str = "?"
+  if cmd_n > 0 {
+    cmd = json_to_str(cmd_n)
+  }
+  let count_n: i64 = json_get(parsed, "rowCount")
+  let mut count: i64 = 0
+  if count_n > 0 {
+    count = json_to_float(count_n) as i64
+  }
+  let fields_n: i64 = json_get(parsed, "fields")
+  let rows_n: i64 = json_get(parsed, "rows")
+
+  if fields_n <= 0 or rows_n <= 0 {
+    return cmd + " ok (" + to_string(count) + " rows affected)"
+  }
+
+  let nfields: i64 = json_length(fields_n)
+  let mut header: str = "|"
+  let mut sep: str = "|"
+  let mut k: i64 = 0
+  while k < nfields {
+    let f: i64 = json_get_index(fields_n, k)
+    let nm_n: i64 = json_get(f, "name")
+    let mut nm: str = "col" + to_string(k)
+    if nm_n > 0 {
+      nm = json_to_str(nm_n)
+    }
+    header = header + " " + nm + " |"
+    sep = sep + "---|"
+    k = k + 1
+  }
+
+  let nrows: i64 = json_length(rows_n)
+  let mut display_rows: i64 = nrows
+  if nrows > LIMIT_MAX_ROWS {
+    display_rows = LIMIT_MAX_ROWS
+  }
+  let mut body_str: str = ""
+  let mut r: i64 = 0
+  while r < display_rows {
+    let row: i64 = json_get_index(rows_n, r)
+    let mut line: str = "|"
+    let mut c: i64 = 0
+    while c < nfields {
+      let v: i64 = json_get_index(row, c)
+      let mut cell: str = ""
+      if v > 0 {
+        cell = json_to_str(v)
+      }
+      line = line + " " + cell + " |"
+      c = c + 1
+    }
+    body_str = body_str + line + "\n"
+    r = r + 1
+  }
+  let mut summary: str = cmd + " — " + to_string(nrows) + " rows"
+  if nrows > display_rows {
+    summary = summary + " (showing first " + to_string(display_rows) + ", capped by max_rows)"
+  }
+  return summary + "\n\n" + header + "\n" + sep + "\n" + body_str
+}
+
+// ===========================================================================
+// MCP tools
+// ===========================================================================
+
+fn tool_query(args_node: i64) -> i64 {
+  if GRANTS_LOADED == 0 {
+    return err_content("grants not loaded: " + LOAD_ERROR)
+  }
+  let sql_n: i64 = json_get(args_node, "sql")
+  if sql_n <= 0 {
+    return err_content("missing 'sql' argument")
+  }
+  let sql: str = json_to_str(sql_n)
+  let refusal: str = validate_sql(sql)
+  if len(refusal) > 0 {
+    return err_content("REFUSED by grants: " + refusal)
+  }
+  let params_n: i64 = json_get(args_node, "params")
+  let resp: i64 = neon_query(sql, params_n)
+  return text_content(format_response(resp))
+}
+
+fn tool_explain(args_node: i64) -> i64 {
+  if GRANTS_LOADED == 0 {
+    return err_content("grants not loaded: " + LOAD_ERROR)
+  }
+  let sql_n: i64 = json_get(args_node, "sql")
+  if sql_n <= 0 {
+    return err_content("missing 'sql' argument")
+  }
+  let sql: str = json_to_str(sql_n)
+  let refusal: str = validate_sql(sql)
+  if len(refusal) > 0 {
+    return err_content("REFUSED by grants: " + refusal)
+  }
+  let wrapped: str = "EXPLAIN " + sql
+  let resp: i64 = neon_query(wrapped, 0)
+  return text_content(format_response(resp))
+}
+
+fn tool_dry_run(args_node: i64) -> i64 {
+  if GRANTS_LOADED == 0 {
+    return err_content("grants not loaded: " + LOAD_ERROR)
+  }
+  let sql_n: i64 = json_get(args_node, "sql")
+  if sql_n <= 0 {
+    return err_content("missing 'sql' argument")
+  }
+  let sql: str = json_to_str(sql_n)
+  let refusal: str = validate_sql(sql)
+  if len(refusal) > 0 {
+    return text_content("WOULD REFUSE: " + refusal)
+  }
+  let lower: str = to_lower(sql)
+  let padded: str = " " + lower + " "
+  let refs: [str] = referenced_tables(padded)
+  return text_content("WOULD ALLOW. action=" + classify_action(lower) + ", tables_referenced=[" + join_csv(refs) + "]")
+}
+
+fn tool_tables(args_node: i64) -> i64 {
+  if GRANTS_LOADED == 0 {
+    return err_content("grants not loaded: " + LOAD_ERROR)
+  }
+  let mut out: str = "Granted tables:\n\n"
+  out = out + "| schema | name | actions | columns | filter |\n"
+  out = out + "|---|---|---|---|---|\n"
+  let mut i: i64 = 0
+  while i < len(TBL_NAMES) {
+    out = out + "| " + TBL_SCHEMAS[i] + " | " + TBL_NAMES[i] + " | " + TBL_ACTIONS[i] + " | " + TBL_COLUMNS[i] + " | " + TBL_FILTERS[i] + " |\n"
+    i = i + 1
+  }
+  return text_content(out)
+}
+
+fn tool_schema(args_node: i64) -> i64 {
+  if GRANTS_LOADED == 0 {
+    return err_content("grants not loaded: " + LOAD_ERROR)
+  }
+  let name_n: i64 = json_get(args_node, "table")
+  if name_n <= 0 {
+    return err_content("missing 'table' argument")
+  }
+  let table: str = json_to_str(name_n)
+  if arr_contains(TBL_NAMES, table) == 0 {
+    return err_content("table '" + table + "' is not in grants. " + grant_table_summary())
+  }
+  let sql: str = "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '" + table + "' ORDER BY ordinal_position"
+  let resp: i64 = neon_query(sql, 0)
+  return text_content(format_response(resp))
+}
+
+fn tool_grants(args_node: i64) -> i64 {
+  if GRANTS_LOADED == 0 {
+    return err_content("grants not loaded: " + LOAD_ERROR)
+  }
+  let mut out: str = "Active grants:\n\n"
+  out = out + "- host: " + CONN_HOST + "\n"
+  out = out + "- statement_timeout_ms: " + to_string(LIMIT_TIMEOUT_MS) + "\n"
+  out = out + "- max_rows: " + to_string(LIMIT_MAX_ROWS) + "\n"
+  out = out + "- ddl_allowed: " + to_string(DDL_ALLOWED) + "\n"
+  out = out + "- deny_select_star: " + to_string(SHAPE_DENY_SELECT_STAR) + "\n"
+  out = out + "- require_where_on_writes: " + to_string(SHAPE_REQUIRE_WHERE_ON_WRITES) + "\n"
+  out = out + "- allow_window: " + to_string(SHAPE_ALLOW_WINDOW) + "\n"
+  out = out + "\nTables: " + grant_table_summary()
+  return text_content(out)
+}
+
+// ===========================================================================
+// Tool catalog
+// ===========================================================================
+
+fn prop_string() -> i64 {
+  return json_object(["type"], [json_string("string")])
+}
+
+fn prop_array() -> i64 {
+  return json_object(["type"], [json_string("array")])
+}
+
+fn schema_def(prop_names: [str], prop_nodes: [i64], required: [str]) -> i64 {
+  let req_nodes: [i64] = []
+  let mut i: i64 = 0
+  while i < len(required) {
+    push(req_nodes, json_string(required[i]))
+    i = i + 1
+  }
+  let props: i64 = json_object(prop_names, prop_nodes)
+  return json_object(
+    ["type", "properties", "required"],
+    [json_string("object"), props, json_array(req_nodes)]
+  )
+}
+
+fn tool_def(name: str, description: str, schema_node: i64) -> i64 {
+  return json_object(
+    ["name", "description", "inputSchema"],
+    [json_string(name), json_string(description), schema_node]
+  )
+}
+
+fn list_tools_result() -> i64 {
+  let s_query: i64 = schema_def(["sql", "params"], [prop_string(), prop_array()], ["sql"])
+  let s_explain: i64 = schema_def(["sql"], [prop_string()], ["sql"])
+  let s_dry: i64 = schema_def(["sql"], [prop_string()], ["sql"])
+  let s_tables: i64 = schema_def([], [], [])
+  let s_schema: i64 = schema_def(["table"], [prop_string()], ["table"])
+  let s_grants: i64 = schema_def([], [], [])
+
+  let tools: [i64] = [
+    tool_def("query",
+      "Run a SELECT/INSERT/UPDATE/DELETE against Postgres. Validated against grants before execution.",
+      s_query),
+    tool_def("explain",
+      "Run EXPLAIN on a query. Subject to the same grant validation as 'query'.",
+      s_explain),
+    tool_def("dry_run",
+      "Validate a SQL statement against the grants without executing it. Returns WOULD ALLOW or WOULD REFUSE.",
+      s_dry),
+    tool_def("tables",
+      "List the tables this MCP server is granted to access.",
+      s_tables),
+    tool_def("schema",
+      "Show columns + types for a granted table.",
+      s_schema),
+    tool_def("grants",
+      "Dump the active grant configuration.",
+      s_grants)
+  ]
+  return json_object(["tools"], [json_array(tools)])
+}
+
+fn call_tool(name: str, args_node: i64) -> i64 {
+  if name == "query" {
+    return tool_query(args_node)
+  }
+  if name == "explain" {
+    return tool_explain(args_node)
+  }
+  if name == "dry_run" {
+    return tool_dry_run(args_node)
+  }
+  if name == "tables" {
+    return tool_tables(args_node)
+  }
+  if name == "schema" {
+    return tool_schema(args_node)
+  }
+  if name == "grants" {
+    return tool_grants(args_node)
+  }
+  return err_content("unknown tool: " + name)
+}
+
+// ===========================================================================
+// JSON-RPC dispatch
+// ===========================================================================
+
+fn handle_message(line: str) -> str {
+  let req: i64 = json_parse(line)
+  if req <= 0 {
+    return make_error(0, -32700, "parse error")
+  }
+  let method_n: i64 = json_get(req, "method")
+  if method_n <= 0 {
+    return ""
+  }
+  let method: str = json_to_str(method_n)
+  let id_n: i64 = json_get(req, "id")
+  let mut id: i64 = 0
+  if id_n > 0 {
+    id = json_to_float(id_n) as i64
+  }
+
+  if id_n <= 0 {
+    if method == "exit" {
+      SHUTDOWN = 1
+    }
+    return ""
+  }
+
+  if method == "initialize" {
+    let server_info: i64 = json_object(
+      ["name", "version"],
+      [json_string("kryos-mcp-pg"), json_string("0.1.0")]
+    )
+    let cap: i64 = json_object(["tools"], [json_object([], [])])
+    let result: i64 = json_object(
+      ["protocolVersion", "serverInfo", "capabilities"],
+      [json_string("2024-11-05"), server_info, cap]
+    )
+    return make_result(id, result)
+  }
+  if method == "tools/list" {
+    return make_result(id, list_tools_result())
+  }
+  if method == "tools/call" {
+    let params: i64 = json_get(req, "params")
+    if params <= 0 {
+      return make_error(id, -32602, "missing params")
+    }
+    let name_n: i64 = json_get(params, "name")
+    if name_n <= 0 {
+      return make_error(id, -32602, "missing tool name")
+    }
+    let name: str = json_to_str(name_n)
+    let args_node: i64 = json_get(params, "arguments")
+    return make_result(id, call_tool(name, args_node))
+  }
+  if method == "shutdown" {
+    SHUTDOWN = 1
+    return make_result(id, json_object([], []))
+  }
+  return make_error(id, -32601, "method not found: " + method)
+}
+
+// ===========================================================================
+// Main
+// ===========================================================================
+
+@capabilities(net, env, io)
+fn main() {
+  let ok: i64 = load_grants()
+  if ok == 0 {
+    eprintln("[kryos-mcp-pg] startup: " + LOAD_ERROR)
+  } else {
+    eprintln("[kryos-mcp-pg] grants loaded: " + to_string(len(TBL_NAMES)) + " tables, host=" + CONN_HOST)
+  }
+
+  while SHUTDOWN == 0 {
+    let line: str = read_line()
+    if len(line) == 0 {
+      break
+    }
+    let resp: str = handle_message(line)
+    if len(resp) > 0 {
+      println(resp)
+    }
+  }
+}

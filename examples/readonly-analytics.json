@@ -1,0 +1,40 @@
+{
+  "_comment": "Analytics-style read-only access across multiple tables. No writes. Window functions enabled (analytics needs them).",
+
+  "connection": { "url_env": "DATABASE_URL" },
+
+  "limits": {
+    "statement_timeout_ms": 30000,
+    "max_rows": 10000,
+    "max_query_bytes": 65536
+  },
+
+  "tables": [
+    {
+      "name": "events",
+      "schema": "analytics",
+      "actions": ["read"],
+      "columns": ["id", "user_id", "event_type", "properties", "created_at"]
+    },
+    {
+      "name": "users",
+      "schema": "public",
+      "actions": ["read"],
+      "columns": ["id", "email", "plan", "created_at"],
+      "filter": "deleted_at IS NULL"
+    },
+    {
+      "name": "subscriptions",
+      "schema": "public",
+      "actions": ["read"],
+      "columns": ["id", "user_id", "plan", "status", "started_at", "ended_at"]
+    }
+  ],
+
+  "ddl": { "allowed": false },
+  "shape": {
+    "deny_select_star": true,
+    "require_where_on_writes": true,
+    "allow_window": true
+  }
+}

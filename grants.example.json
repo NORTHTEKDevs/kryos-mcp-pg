@@ -1,0 +1,45 @@
+{
+  "_comment": "kryos-mcp-pg grants. Default is DENY for everything not listed. Copy to grants.json or set KRYOS_MCP_PG_GRANTS=/path/to/file.",
+
+  "connection": {
+    "url_env": "DATABASE_URL"
+  },
+
+  "limits": {
+    "statement_timeout_ms": 5000,
+    "max_rows": 1000,
+    "max_query_bytes": 16384
+  },
+
+  "tables": [
+    {
+      "name": "users",
+      "schema": "public",
+      "actions": ["read"],
+      "columns": ["id", "email", "name", "created_at"],
+      "filter": "deleted_at IS NULL"
+    },
+    {
+      "name": "orders",
+      "schema": "public",
+      "actions": ["read", "write"],
+      "columns": ["*"]
+    },
+    {
+      "name": "audit_log",
+      "schema": "public",
+      "actions": ["write"],
+      "columns": ["*"]
+    }
+  ],
+
+  "ddl": {
+    "allowed": false
+  },
+
+  "shape": {
+    "deny_select_star": true,
+    "require_where_on_writes": true,
+    "allow_window": false
+  }
+}

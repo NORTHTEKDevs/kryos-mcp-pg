@@ -1,0 +1,14 @@
+{
+  "_comment": "Drop into ~/Library/Application Support/Claude/claude_desktop_config.json (macOS) or %APPDATA%\\Claude\\claude_desktop_config.json (Windows). Replace paths and DATABASE_URL with your own.",
+
+  "mcpServers": {
+    "pg": {
+      "command": "kryos",
+      "args": ["run", "/absolute/path/to/kryos-mcp-pg/src/main.kry"],
+      "env": {
+        "DATABASE_URL": "postgresql://user:password@ep-foo-bar.us-east-2.aws.neon.tech/mydb",
+        "KRYOS_MCP_PG_GRANTS": "/absolute/path/to/kryos-mcp-pg/grants.json"
+      }
+    }
+  }
+}
