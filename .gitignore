@@ -22,3 +22,6 @@ grants.local.toml
 .idea/
 *.swp
 .DS_Store
+main.exe
+main.pdb
+*.pdb
