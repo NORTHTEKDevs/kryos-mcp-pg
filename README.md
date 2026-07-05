@@ -78,7 +78,14 @@ DATABASE_URL=postgresql://user:pass@ep-foo-bar.region.aws.neon.tech/db \
   kryos run src/main.kry
 ```
 
-> **v0.1 note:** `kryos build --release` (LLVM AOT) currently fails because the Kryos 1.0 LLVM backend is missing JSON / `http_request` builtins that the Cranelift backend has. Use `kryos run` until upstream lands those bindings — the Cranelift JIT is fast enough for production MCP usage. Tracked in [ROADMAP.md](docs/ROADMAP.md).
+Or ship it as a **single standalone binary** — no toolchain install on the target:
+
+```bash
+kryos build --release src/main.kry     # produces main.exe (~7 MB, LLVM AOT)
+DATABASE_URL=... KRYOS_MCP_PG_GRANTS=./grants.json ./main.exe
+```
+
+> **v0.3 note:** the LLVM AOT release build now works end-to-end — JSON and `http_request` builtins are linked, and the standalone binary passes the full validator suite (verified byte-identical to the Cranelift JIT). The earlier v0.1 limitation (release build missing those builtins) is resolved.
 
 ### Claude Desktop config
 

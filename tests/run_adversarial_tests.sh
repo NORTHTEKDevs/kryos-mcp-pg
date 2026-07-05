@@ -8,7 +8,13 @@ export DATABASE_URL="postgresql://fake:fake@ep-test-host.aws.neon.tech/db"
 export KRYOS_MCP_PG_GRANTS="grants.example.json"
 
 OUT="$(mktemp)"; trap 'rm -f "$OUT"' EXIT
-kryos run src/main.kry < tests/adversarial-scenarios.jsonl > "$OUT" 2>/dev/null
+# Prefer the compiled release binary (fast, and it is the shipped artifact);
+# fall back to the JIT from source.
+if [ -x "./main.exe" ]; then
+  ./main.exe < tests/adversarial-scenarios.jsonl > "$OUT" 2>/dev/null
+else
+  kryos run src/main.kry < tests/adversarial-scenarios.jsonl > "$OUT" 2>/dev/null
+fi
 
 # id -> expected verdict + label
 declare -A EXP=(
@@ -25,6 +31,11 @@ declare -A EXP=(
   [110]="REFUSE|comment-smuggled FROM secrets"
   [111]="ALLOW|count(*) is not SELECT *"
   [112]="ALLOW|write with WHERE"
+  [200]="REFUSE|UNION to ungranted table"
+  [201]="REFUSE|CTE reading ungranted table"
+  [202]="ALLOW|alias-qualified column read"
+  [203]="REFUSE|INSERT into read-only table"
+  [204]="REFUSE|tab-separated FROM ungranted"
 )
 
 PASS=0; FAIL=0

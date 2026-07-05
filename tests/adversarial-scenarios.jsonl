@@ -13,3 +13,8 @@
 {"jsonrpc":"2.0","id":110,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT id/**/FROM/**/secrets WHERE id=1"}}}
 {"jsonrpc":"2.0","id":111,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT count(*) FROM orders WHERE id > 0"}}}
 {"jsonrpc":"2.0","id":112,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"UPDATE orders SET status = 'x' WHERE id = 1"}}}
+{"jsonrpc":"2.0","id":200,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT id FROM orders WHERE id=1 UNION SELECT id FROM secrets"}}}
+{"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"WITH x AS (SELECT k FROM secrets) SELECT k FROM x"}}}
+{"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT email FROM users u WHERE u.deleted_at IS NULL"}}}
+{"jsonrpc":"2.0","id":203,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"INSERT INTO users (id) VALUES (1)"}}}
+{"jsonrpc":"2.0","id":204,"method":"tools/call","params":{"name":"dry_run","arguments":{"sql":"SELECT id\tFROM\tsecrets WHERE id=1"}}}
