@@ -22,6 +22,8 @@
 //     KRYOS_MCP_PG_GRANTS=./grants.json \
 //     kryos run src/main.kry
 
+use std::db::{open, execute, query, step, col_count, col_text, finalize, close}
+
 // ===========================================================================
 // State
 // ===========================================================================
@@ -30,6 +32,8 @@ let mut SHUTDOWN: i64 = 0
 
 let mut CONN_URL: str = ""
 let mut CONN_HOST: str = ""
+let mut BACKEND: str = "neon"
+let mut DB_PATH: str = ""
 let mut LIMIT_TIMEOUT_MS: i64 = 5000
 let mut LIMIT_MAX_ROWS: i64 = 1000
 let mut LIMIT_MAX_QUERY_BYTES: i64 = 16384
@@ -283,10 +287,22 @@ fn load_grants() -> i64 {
     return 0
   }
   CONN_URL = url
-  CONN_HOST = parse_host(url)
-  if len(CONN_HOST) == 0 {
-    LOAD_ERROR = "could not parse host from connection URL"
-    return 0
+  // Backend selection by URL scheme. sqlite:<path> uses the native, $0,
+  // no-network SQLite engine (@capabilities(db)); anything else is Neon HTTP.
+  if starts_with(url, "sqlite:") {
+    BACKEND = "sqlite"
+    DB_PATH = substr(url, 7, len(url))
+    if len(DB_PATH) == 0 {
+      LOAD_ERROR = "sqlite: URL has no path (use sqlite:./data.db or sqlite::memory:)"
+      return 0
+    }
+  } else {
+    BACKEND = "neon"
+    CONN_HOST = parse_host(url)
+    if len(CONN_HOST) == 0 {
+      LOAD_ERROR = "could not parse host from connection URL"
+      return 0
+    }
   }
 
   let limits_n: i64 = json_get(cfg, "limits")
@@ -997,6 +1013,58 @@ fn neon_query(sql: str, params_node: i64) -> i64 {
   return http_request("POST", url, headers, body, LIMIT_TIMEOUT_MS + 10000)
 }
 
+// ===========================================================================
+// Local SQLite execution ($0, no network — capability is db, never net)
+// ===========================================================================
+
+@capabilities(db)
+fn sqlite_run(sql: str) -> str {
+  let conn = open(DB_PATH)
+  let action: str = classify_action(to_lower(sql))
+  if action == "read" {
+    let cur = query(conn, sql)
+    let ncols: i64 = col_count(cur) as i64
+    let mut header: str = "|"
+    let mut sep: str = "|"
+    let mut c: i64 = 0
+    while c < ncols {
+      header = header + " c" + to_string(c) + " |"
+      sep = sep + "---|"
+      c = c + 1
+    }
+    let mut body_str: str = ""
+    let mut nrows: i64 = 0
+    while step(cur) {
+      if nrows < LIMIT_MAX_ROWS {
+        let mut line: str = "|"
+        let mut k: i64 = 0
+        while k < ncols {
+          line = line + " " + col_text(cur, k as i32) + " |"
+          k = k + 1
+        }
+        body_str = body_str + line + "\n"
+      }
+      nrows = nrows + 1
+    }
+    finalize(cur)
+    close(conn)
+    let mut summary: str = "SELECT — " + to_string(nrows) + " rows"
+    if nrows > LIMIT_MAX_ROWS {
+      summary = summary + " (showing first " + to_string(LIMIT_MAX_ROWS) + ", capped by max_rows)"
+    }
+    if ncols == 0 {
+      return summary
+    }
+    return summary + "\n\n" + header + "\n" + sep + "\n" + body_str
+  }
+  let n: i64 = execute(conn, sql)
+  close(conn)
+  if n < 0 {
+    return "statement failed (SQLite returned an error)"
+  }
+  return "OK (" + to_string(n) + " rows affected)"
+}
+
 fn format_response(resp: i64) -> str {
   if resp <= 0 {
     return "request to Neon failed (no response)"
@@ -1098,6 +1166,9 @@ fn tool_query(args_node: i64) -> i64 {
     return err_content("REFUSED by grants: " + refusal)
   }
   audit("query", sql, "allowed", "")
+  if BACKEND == "sqlite" {
+    return text_content(sqlite_run(sql))
+  }
   let params_n: i64 = json_get(args_node, "params")
   let resp: i64 = neon_query(sql, params_n)
   return text_content(format_response(resp))
@@ -1119,6 +1190,9 @@ fn tool_explain(args_node: i64) -> i64 {
   }
   audit("explain", sql, "allowed", "")
   let wrapped: str = "EXPLAIN " + sql
+  if BACKEND == "sqlite" {
+    return text_content(sqlite_run("EXPLAIN QUERY PLAN " + sql))
+  }
   let resp: i64 = neon_query(wrapped, 0)
   return text_content(format_response(resp))
 }
@@ -1359,7 +1433,7 @@ fn handle_message(line: str) -> str {
 // Main
 // ===========================================================================
 
-@capabilities(net, env, io, time)
+@capabilities(net, env, io, time, db)
 fn main() {
   let ok: i64 = load_grants()
   if ok == 0 {

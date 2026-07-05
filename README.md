@@ -1,6 +1,6 @@
 # kryos-mcp-pg
 
-A capability-gated Postgres MCP server, written in [Kryos](https://github.com/NORTHTEKDevs/kryos-lang).
+A capability-gated SQL MCP server, written in [Kryos](https://github.com/NORTHTEKDevs/kryos-lang). Runs against **local SQLite ($0, no network)** or **hosted Postgres (Neon HTTP)** — same grants, same validator, one binary.
 
 Every SQL statement is validated against a grant config before it touches the wire. If a grant doesn't permit it, the tool call returns a refusal and Postgres never sees the query. No prompt instructions to ignore. No "please don't drop the table." A small, auditable rule file decides what an LLM is allowed to do.
 
@@ -70,13 +70,28 @@ cd kryos-mcp-pg
 cp grants.example.json grants.json     # edit for your database
 ```
 
-Run as an MCP server:
+Run as an MCP server. Two backends, selected by the `DATABASE_URL` scheme:
+
+**Local SQLite — $0, no network, no credential** (the `db` capability, never `net`):
+
+```bash
+DATABASE_URL=sqlite:./data.db \
+  KRYOS_MCP_PG_GRANTS=./grants.json \
+  kryos run src/main.kry
+```
+
+**Hosted Postgres over Neon's HTTP endpoint:**
 
 ```bash
 DATABASE_URL=postgresql://user:pass@ep-foo-bar.region.aws.neon.tech/db \
   KRYOS_MCP_PG_GRANTS=./grants.json \
   kryos run src/main.kry
 ```
+
+The grant file, the tokenizing validator, column allowlists and row filters are
+**identical across both backends** — only the execution layer differs. The SQLite
+backend is the cheapest way to run this and the strongest security posture: a
+governed-SQL server the compiler proves cannot touch the network.
 
 Or ship it as a **single standalone binary** — no toolchain install on the target:
 
