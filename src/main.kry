@@ -443,195 +443,539 @@ fn audit(tool: str, sql: str, verdict: str, reason: str) {
 // SQL inspection — coarse but useful
 // ===========================================================================
 
-fn classify_action(sql_lower: str) -> str {
-  if starts_with(sql_lower, "select ") {
+// ===========================================================================
+// SQL tokenizer + token-based validator (v0.3)
+//
+// The v0.1/v0.2 validator matched raw-string substrings, which an adversary
+// defeats trivially: a keyword hidden in a string literal, a doubled space in
+// `SELECT  *`, `over(` without a space, a comma-joined ungranted table, a
+// stacked `; DROP`. This validator tokenizes first — comments removed, string
+// and dollar-quoted literals collapsed to a single sentinel token so their
+// contents can never smuggle syntax — then enforces every rule on the token
+// stream. Column allowlists and per-table row filters are enforced here too
+// (they were loaded but ignored before).
+// ===========================================================================
+
+// A single-quote token can never be a real identifier, so it is a safe sentinel
+// for "some string/dollar-quoted literal was here".
+fn is_ident_char(c: str) -> i64 {
+  if len(c) == 0 {
+    return 0
+  }
+  let letters: str = "abcdefghijklmnopqrstuvwxyz0123456789_"
+  if find_sub(letters, c, 0) >= 0 {
+    return 1
+  }
+  return 0
+}
+
+fn is_ident_tok(t: str) -> i64 {
+  if len(t) == 0 {
+    return 0
+  }
+  return is_ident_char(ch(t, 0))
+}
+
+// Lowercased SQL -> token list. Whitespace separates; comments are dropped;
+// string ('...') and dollar-quoted literals become the sentinel "'".
+fn tokenize(sql_lower: str) -> [str] {
+  let toks: [str] = []
+  let n: i64 = len(sql_lower)
+  let mut i: i64 = 0
+  while i < n {
+    let c: str = ch(sql_lower, i)
+    if c == " " or c == "\t" or c == "\n" or c == "\r" {
+      i = i + 1
+    } elif c == "-" and i + 1 < n and ch(sql_lower, i + 1) == "-" {
+      let mut j: i64 = i + 2
+      while j < n and ch(sql_lower, j) != "\n" {
+        j = j + 1
+      }
+      i = j
+    } elif c == "/" and i + 1 < n and ch(sql_lower, i + 1) == "*" {
+      let mut j: i64 = i + 2
+      let mut done: i64 = 0
+      while j + 1 < n and done == 0 {
+        if ch(sql_lower, j) == "*" and ch(sql_lower, j + 1) == "/" {
+          done = 1
+        } else {
+          j = j + 1
+        }
+      }
+      i = j + 2
+    } elif c == "'" {
+      let mut j: i64 = i + 1
+      let mut closed: i64 = 0
+      while j < n and closed == 0 {
+        if ch(sql_lower, j) == "'" {
+          if j + 1 < n and ch(sql_lower, j + 1) == "'" {
+            j = j + 2
+          } else {
+            closed = 1
+          }
+        } else {
+          j = j + 1
+        }
+      }
+      push(toks, "'")
+      i = j + 1
+    } elif c == "$" {
+      let mut k: i64 = i + 1
+      while k < n and ch(sql_lower, k) != "$" and is_ident_char(ch(sql_lower, k)) == 1 {
+        k = k + 1
+      }
+      if k < n and ch(sql_lower, k) == "$" {
+        let tag: str = substr(sql_lower, i, k + 1)
+        let close_at: i64 = find_sub(sql_lower, tag, k + 1)
+        if close_at >= 0 {
+          push(toks, "'")
+          i = close_at + len(tag)
+        } else {
+          push(toks, "$")
+          i = i + 1
+        }
+      } else {
+        // bare $ (e.g. a $1 parameter) -> read as an identifier run
+        let mut j: i64 = i
+        while j < n and (is_ident_char(ch(sql_lower, j)) == 1 or ch(sql_lower, j) == "$") {
+          j = j + 1
+        }
+        push(toks, substr(sql_lower, i, j))
+        i = j
+      }
+    } elif is_ident_char(c) == 1 {
+      let mut j: i64 = i
+      while j < n and is_ident_char(ch(sql_lower, j)) == 1 {
+        j = j + 1
+      }
+      push(toks, substr(sql_lower, i, j))
+      i = j
+    } else {
+      push(toks, c)
+      i = i + 1
+    }
+  }
+  return toks
+}
+
+fn tok_action(toks: [str]) -> str {
+  if len(toks) == 0 {
+    return "unknown"
+  }
+  let t0: str = toks[0]
+  if t0 == "select" or t0 == "with" or t0 == "explain" {
     return "read"
   }
-  if starts_with(sql_lower, "with ") {
-    return "read"
-  }
-  if starts_with(sql_lower, "explain ") {
-    return "read"
-  }
-  if starts_with(sql_lower, "insert ") {
+  if t0 == "insert" or t0 == "update" or t0 == "delete" or t0 == "merge" {
     return "write"
   }
-  if starts_with(sql_lower, "update ") {
-    return "write"
-  }
-  if starts_with(sql_lower, "delete ") {
-    return "write"
-  }
-  if starts_with(sql_lower, "merge ") {
-    return "write"
-  }
-  if starts_with(sql_lower, "create ") {
-    return "ddl"
-  }
-  if starts_with(sql_lower, "alter ") {
-    return "ddl"
-  }
-  if starts_with(sql_lower, "drop ") {
-    return "ddl"
-  }
-  if starts_with(sql_lower, "truncate ") {
+  if t0 == "create" or t0 == "alter" or t0 == "drop" or t0 == "truncate" {
     return "ddl"
   }
   return "unknown"
 }
 
-// Returns the granted-table names referenced by `sql_lower` (already padded
-// with leading + trailing space). Returns qualified names (schema.table).
-// v0.2: bare references match only when the grant entry's schema is "public".
-fn referenced_tables(sql_lower: str) -> [str] {
-  let found: [str] = []
+// More than one statement: a ";" that is not the final token.
+fn has_stacked(toks: [str]) -> i64 {
   let mut i: i64 = 0
-  while i < len(TBL_QUALIFIED) {
-    let qname: str = TBL_QUALIFIED[i]
-    let bname: str = TBL_NAMES[i]
-    let mut hit: i64 = 0
-    // Qualified-form patterns (schema.table) — always checked.
-    if contains(sql_lower, " " + qname + " ") { hit = 1 }
-    if contains(sql_lower, " " + qname + ",") { hit = 1 }
-    if contains(sql_lower, " " + qname + "(") { hit = 1 }
-    if contains(sql_lower, " " + qname + ";") { hit = 1 }
-    if ends_with(sql_lower, " " + qname) { hit = 1 }
-    // Bare-name patterns — only meaningful when the grant is in "public".
-    // A grant like `analytics.events` does NOT match bare `events` references.
-    if TBL_SCHEMAS[i] == "public" {
-      if contains(sql_lower, " " + bname + " ") { hit = 1 }
-      if contains(sql_lower, " " + bname + ",") { hit = 1 }
-      if contains(sql_lower, " " + bname + "(") { hit = 1 }
-      if contains(sql_lower, " " + bname + ";") { hit = 1 }
-      if ends_with(sql_lower, " " + bname) { hit = 1 }
-    }
-    if hit == 1 {
-      push(found, qname)
+  while i < len(toks) {
+    if toks[i] == ";" and i + 1 < len(toks) {
+      return 1
     }
     i = i + 1
-  }
-  return found
-}
-
-// Look for "from <ident>" / "join <ident>" / "into <ident>" / "update <ident>"
-// / "table <ident>" and refuse if the identifier is not in TBL_NAMES.
-fn has_ungranted_table(sql_lower: str) -> i64 {
-  let prefixes: [str] = ["from ", "join ", "into ", "update ", "table "]
-  let mut p: i64 = 0
-  while p < len(prefixes) {
-    let prefix: str = prefixes[p]
-    let mut start: i64 = 0
-    let nl: i64 = len(sql_lower)
-    while start >= 0 and start < nl {
-      let idx: i64 = find_sub(sql_lower, prefix, start)
-      if idx < 0 {
-        break
-      }
-      let after: i64 = idx + len(prefix)
-      let mut j: i64 = after
-      while j < nl {
-        let c: str = ch(sql_lower, j)
-        if c == " " {
-          break
-        }
-        if c == "," {
-          break
-        }
-        if c == ";" {
-          break
-        }
-        if c == "(" {
-          break
-        }
-        if c == ")" {
-          break
-        }
-        if c == "\n" {
-          break
-        }
-        if c == "\t" {
-          break
-        }
-        j = j + 1
-      }
-      let ident: str = substr(sql_lower, after, j)
-      if len(ident) > 0 {
-        let dot: i64 = find_sub(ident, ".", 0)
-        let mut qualified: str = ident
-        if dot < 0 {
-          qualified = "public." + ident
-        }
-        if arr_contains(TBL_QUALIFIED, qualified) == 0 {
-          return 1
-        }
-      }
-      start = j
-    }
-    p = p + 1
   }
   return 0
 }
 
-// Validate a SQL statement against grants.
-// Returns "" on pass, or a refusal reason on fail.
+// A "*" used for column expansion (select * / t.*), as opposed to count(*).
+fn has_select_star(toks: [str]) -> i64 {
+  let mut i: i64 = 0
+  while i < len(toks) {
+    if toks[i] == "*" {
+      let mut prev: str = ""
+      if i > 0 {
+        prev = toks[i - 1]
+      }
+      if prev != "(" {
+        return 1
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn has_window(toks: [str]) -> i64 {
+  let mut i: i64 = 0
+  while i + 1 < len(toks) {
+    if toks[i] == "over" and toks[i + 1] == "(" {
+      return 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// True keyword token, so "where" inside a string literal cannot satisfy it
+// (literals are already collapsed to "'").
+fn has_where_kw(toks: [str]) -> i64 {
+  return arr_contains(toks, "where")
+}
+
+// Index of the qualified identifier's last token starting at p (schema.table
+// consumes 3 tokens; bare consumes 1). Assumes toks[p] is an identifier.
+fn qual_end(toks: [str], p: i64) -> i64 {
+  if p + 2 < len(toks) and toks[p + 1] == "." and is_ident_tok(toks[p + 2]) == 1 {
+    return p + 2
+  }
+  return p
+}
+
+fn qual_name(toks: [str], p: i64) -> str {
+  if p + 2 < len(toks) and toks[p + 1] == "." and is_ident_tok(toks[p + 2]) == 1 {
+    return toks[p] + "." + toks[p + 2]
+  }
+  return toks[p]
+}
+
+fn normalize_table(name: str) -> str {
+  if find_sub(name, ".", 0) < 0 {
+    return "public." + name
+  }
+  return name
+}
+
+fn is_clause_kw(t: str) -> i64 {
+  if t == "where" or t == "join" or t == "inner" or t == "left" or t == "right" or t == "full" or t == "outer" or t == "cross" or t == "on" or t == "using" or t == "group" or t == "order" or t == "having" or t == "limit" or t == "offset" or t == "union" or t == "except" or t == "intersect" or t == "set" or t == "values" or t == "returning" or t == "select" or t == "as" {
+    return 1
+  }
+  return 0
+}
+
+// Every table referenced after from/join/into/update/table, including
+// comma-separated lists (from a, b) and their aliases.
+fn extract_tables(toks: [str]) -> [str] {
+  let out: [str] = []
+  let n: i64 = len(toks)
+  let mut i: i64 = 0
+  while i < n {
+    let t: str = toks[i]
+    if t == "from" or t == "join" or t == "into" or t == "update" or t == "table" {
+      let mut j: i64 = i + 1
+      let mut more: i64 = 1
+      while more == 1 and j < n {
+        if is_ident_tok(toks[j]) == 1 and is_clause_kw(toks[j]) == 0 {
+          let name: str = normalize_table(qual_name(toks, j))
+          if arr_contains(out, name) == 0 {
+            push(out, name)
+          }
+          j = qual_end(toks, j) + 1
+          // optional alias: a bare identifier that is not a clause keyword
+          if j < n and is_ident_tok(toks[j]) == 1 and is_clause_kw(toks[j]) == 0 {
+            j = j + 1
+          } elif j + 1 < n and toks[j] == "as" and is_ident_tok(toks[j + 1]) == 1 {
+            j = j + 2
+          }
+          // continue only across a comma (another table in the list)
+          if j < n and toks[j] == "," {
+            j = j + 1
+          } else {
+            more = 0
+          }
+        } else {
+          more = 0
+        }
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Column identifiers in the select list (between the leading select and the
+// first from). Function names, aliases, the star, literals, and keywords are
+// excluded; qualified table.col is reduced to col.
+fn is_reserved_word(t: str) -> i64 {
+  if t == "distinct" or t == "all" or t == "as" or t == "case" or t == "when" or t == "then" or t == "else" or t == "end" or t == "and" or t == "or" or t == "not" or t == "null" or t == "is" or t == "in" or t == "like" or t == "between" or t == "cast" or t == "coalesce" or t == "true" or t == "false" or t == "on" or t == "using" {
+    return 1
+  }
+  return 0
+}
+
+// Each entry is "qualifier|column"; qualifier is "" for an unqualified column.
+// Function names, aliases (after AS), the star, literals and keywords are excluded.
+fn select_columns(toks: [str]) -> [str] {
+  let cols: [str] = []
+  let n: i64 = len(toks)
+  // find the select that opens the list (skip a leading explain)
+  let mut s: i64 = 0
+  if n > 0 and toks[0] == "explain" {
+    s = 1
+  }
+  if s >= n or toks[s] != "select" {
+    return cols
+  }
+  let mut i: i64 = s + 1
+  while i < n and toks[i] != "from" {
+    let t: str = toks[i]
+    if is_ident_tok(t) == 1 and is_reserved_word(t) == 0 {
+      // function name: identifier immediately followed by "("
+      if i + 1 < n and toks[i + 1] == "(" {
+        i = i + 1
+      } else {
+        let mut prev: str = ""
+        if i > 0 {
+          prev = toks[i - 1]
+        }
+        if prev == "as" {
+          // alias after "as": skip
+          i = i + 1
+        } else {
+          // qualified qual.col -> record qualifier + col; else bare col
+          if i + 2 < n and toks[i + 1] == "." and is_ident_tok(toks[i + 2]) == 1 {
+            push(cols, t + "|" + toks[i + 2])
+            i = i + 3
+          } else {
+            push(cols, "|" + t)
+            i = i + 1
+          }
+        }
+      }
+    } else {
+      i = i + 1
+    }
+  }
+  return cols
+}
+
+fn part_before(s: str, sep: str) -> str {
+  let idx: i64 = find_sub(s, sep, 0)
+  if idx < 0 {
+    return s
+  }
+  return substr(s, 0, idx)
+}
+
+fn part_after(s: str, sep: str) -> str {
+  let idx: i64 = find_sub(s, sep, 0)
+  if idx < 0 {
+    return ""
+  }
+  return substr(s, idx + len(sep), len(s))
+}
+
+fn last_segment(qname: str) -> str {
+  let d: i64 = find_sub(qname, ".", 0)
+  if d < 0 {
+    return qname
+  }
+  return substr(qname, d + 1, len(qname))
+}
+
+// Resolve a select-list qualifier (alias, bare table name, or schema.table) to
+// the qualified granted table it names, or "" if it names none.
+fn resolve_qualifier(toks: [str], q: str) -> str {
+  let n: i64 = len(toks)
+  let mut i: i64 = 0
+  while i < n {
+    let t: str = toks[i]
+    if t == "from" or t == "join" or t == "into" or t == "update" or t == "table" {
+      let mut j: i64 = i + 1
+      let mut more: i64 = 1
+      while more == 1 and j < n {
+        if is_ident_tok(toks[j]) == 1 and is_clause_kw(toks[j]) == 0 {
+          let qualified: str = normalize_table(qual_name(toks, j))
+          j = qual_end(toks, j) + 1
+          let mut alias: str = ""
+          if j < n and is_ident_tok(toks[j]) == 1 and is_clause_kw(toks[j]) == 0 {
+            alias = toks[j]
+            j = j + 1
+          } elif j + 1 < n and toks[j] == "as" and is_ident_tok(toks[j + 1]) == 1 {
+            alias = toks[j + 1]
+            j = j + 2
+          }
+          if q == alias or q == last_segment(qualified) or q == qualified or normalize_table(q) == qualified {
+            return qualified
+          }
+          if j < n and toks[j] == "," {
+            j = j + 1
+          } else {
+            more = 0
+          }
+        } else {
+          more = 0
+        }
+      }
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// Grant lookup helpers keyed by qualified name.
+fn grant_index(qname: str) -> i64 {
+  let mut j: i64 = 0
+  while j < len(TBL_QUALIFIED) {
+    if TBL_QUALIFIED[j] == qname {
+      return j
+    }
+    j = j + 1
+  }
+  return -1
+}
+
+fn contains_subseq(toks: [str], sub: [str]) -> i64 {
+  let n: i64 = len(toks)
+  let m: i64 = len(sub)
+  if m == 0 {
+    return 1
+  }
+  let mut i: i64 = 0
+  while i + m <= n {
+    let mut k: i64 = 0
+    let mut ok: i64 = 1
+    while k < m and ok == 1 {
+      if toks[i + k] != sub[k] {
+        ok = 0
+      }
+      k = k + 1
+    }
+    if ok == 1 {
+      return 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Back-compat wrappers used by dry_run and elsewhere.
+fn classify_action(sql_lower: str) -> str {
+  return tok_action(tokenize(sql_lower))
+}
+
+fn referenced_tables(sql_lower: str) -> [str] {
+  return extract_tables(tokenize(sql_lower))
+}
+
+// Validate a SQL statement against grants. Returns "" on pass, else a reason.
 fn validate_sql(sql: str) -> str {
   if len(sql) > LIMIT_MAX_QUERY_BYTES {
     return "query exceeds max_query_bytes (" + to_string(LIMIT_MAX_QUERY_BYTES) + ")"
   }
   let lower: str = to_lower(sql)
-  let padded: str = " " + lower + " "
-  let action: str = classify_action(lower)
+  let toks: [str] = tokenize(lower)
+  if len(toks) == 0 {
+    return "empty statement refused"
+  }
+  if has_stacked(toks) == 1 {
+    return "multiple statements refused: only one statement per call"
+  }
+  let action: str = tok_action(toks)
   if action == "unknown" {
     return "could not classify SQL action; refused. Allowed leading keywords: select, with, explain, insert, update, delete, merge, create, alter, drop, truncate."
   }
   if action == "ddl" and DDL_ALLOWED == 0 {
     return "DDL refused: ddl.allowed = false in grants"
   }
-  if SHAPE_DENY_SELECT_STAR == 1 and contains(padded, "select *") {
+  if SHAPE_DENY_SELECT_STAR == 1 and has_select_star(toks) == 1 {
     return "SELECT * refused: shape.deny_select_star = true. Use explicit columns."
   }
   if action == "write" and SHAPE_REQUIRE_WHERE_ON_WRITES == 1 {
-    let is_upd: bool = starts_with(lower, "update ")
-    let is_del: bool = starts_with(lower, "delete ")
-    let has_where: bool = contains(padded, " where ")
-    if (is_upd or is_del) and has_where == false {
+    let t0: str = toks[0]
+    if (t0 == "update" or t0 == "delete") and has_where_kw(toks) == 0 {
       return "UPDATE/DELETE without WHERE refused: shape.require_where_on_writes = true"
     }
   }
-  if SHAPE_ALLOW_WINDOW == 0 and contains(padded, " over (") {
+  if SHAPE_ALLOW_WINDOW == 0 and has_window(toks) == 1 {
     return "window functions refused: shape.allow_window = false"
   }
 
-  let refs: [str] = referenced_tables(padded)
-  if action != "ddl" {
-    if has_ungranted_table(padded) == 1 {
-      return "query references a table not in grants. Listed tables: " + grant_table_summary()
+  if action == "ddl" {
+    return ""
+  }
+
+  let refs: [str] = extract_tables(toks)
+  if len(refs) == 0 {
+    return "no granted table referenced. Listed tables: " + grant_table_summary()
+  }
+
+  // Every referenced table must be granted and permit this action.
+  let mut i: i64 = 0
+  while i < len(refs) {
+    let qname: str = refs[i]
+    let gi: i64 = grant_index(qname)
+    if gi < 0 {
+      return "query references a table not in grants: '" + qname + "'. Listed tables: " + grant_table_summary()
     }
-    if len(refs) == 0 {
-      return "no granted table referenced. Listed tables: " + grant_table_summary()
+    if csv_contains(TBL_ACTIONS[gi], action) == 0 {
+      return "table '" + qname + "' not granted action '" + action + "'"
     }
-    let mut i: i64 = 0
-    while i < len(refs) {
-      let qname: str = refs[i]
-      let mut j: i64 = 0
-      let mut ok: i64 = 0
-      while j < len(TBL_QUALIFIED) {
-        if TBL_QUALIFIED[j] == qname {
-          if csv_contains(TBL_ACTIONS[j], action) == 1 {
-            ok = 1
-          }
-          break
+    i = i + 1
+  }
+
+  // Column allowlist (SELECT only). A table whose grant restricts columns may
+  // only be read by columns in that list. Qualified columns (alias.col) are
+  // attributed to their table; an unqualified column is checked against the
+  // single restricted table, or refused as ambiguous when more than one table
+  // is present and any is restricted.
+  if action == "read" and toks[0] != "with" {
+    // is any referenced table column-restricted?
+    let mut restricted: i64 = 0
+    let mut rr: i64 = 0
+    while rr < len(refs) {
+      let gi: i64 = grant_index(refs[rr])
+      if gi >= 0 and TBL_COLUMNS[gi] != "*" and len(TBL_COLUMNS[gi]) > 0 {
+        restricted = 1
+      }
+      rr = rr + 1
+    }
+    if restricted == 1 {
+      let cols: [str] = select_columns(toks)
+      let mut c: i64 = 0
+      while c < len(cols) {
+        let qual: str = part_before(cols[c], "|")
+        let col: str = part_after(cols[c], "|")
+        let mut target: str = ""
+        if len(qual) > 0 {
+          target = resolve_qualifier(toks, qual)
+        } elif len(refs) == 1 {
+          target = refs[0]
+        } else {
+          return "unqualified column '" + col + "' is ambiguous across a multi-table SELECT with a column-restricted table; qualify it (table.column)"
         }
-        j = j + 1
+        if len(target) > 0 {
+          let gi: i64 = grant_index(target)
+          if gi >= 0 and TBL_COLUMNS[gi] != "*" and len(TBL_COLUMNS[gi]) > 0 {
+            if csv_contains(TBL_COLUMNS[gi], col) == 0 {
+              return "column '" + col + "' not in the allowlist for '" + target + "' (" + TBL_COLUMNS[gi] + ")"
+            }
+          }
+        }
+        c = c + 1
       }
-      if ok == 0 {
-        return "table '" + qname + "' not granted action '" + action + "'"
-      }
-      i = i + 1
     }
   }
+
+  // Row filter: a read of a table carrying a filter must include that filter
+  // predicate (verified as a token subsequence). Enforced, not silently
+  // injected — the caller sees exactly what is required.
+  if action == "read" {
+    let mut f: i64 = 0
+    while f < len(refs) {
+      let gi: i64 = grant_index(refs[f])
+      if gi >= 0 and len(TBL_FILTERS[gi]) > 0 {
+        let filt_toks: [str] = tokenize(to_lower(TBL_FILTERS[gi]))
+        if contains_subseq(toks, filt_toks) == 0 {
+          return "read of '" + refs[f] + "' must include the required filter: " + TBL_FILTERS[gi]
+        }
+      }
+      f = f + 1
+    }
+  }
+
   return ""
 }
+
 
 // ===========================================================================
 // Neon HTTP execution
@@ -979,7 +1323,7 @@ fn handle_message(line: str) -> str {
   if method == "initialize" {
     let server_info: i64 = json_object(
       ["name", "version"],
-      [json_string("kryos-mcp-pg"), json_string("0.1.0")]
+      [json_string("kryos-mcp-pg"), json_string("0.3.0")]
     )
     let cap: i64 = json_object(["tools"], [json_object([], [])])
     let result: i64 = json_object(

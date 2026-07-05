@@ -4,7 +4,7 @@ A capability-gated Postgres MCP server, written in [Kryos](https://github.com/NO
 
 Every SQL statement is validated against a grant config before it touches the wire. If a grant doesn't permit it, the tool call returns a refusal and Postgres never sees the query. No prompt instructions to ignore. No "please don't drop the table." A small, auditable rule file decides what an LLM is allowed to do.
 
-> **Status:** v0.1.0 — works end-to-end against any Neon Postgres database via Neon's HTTP serverless endpoint. Six MCP tools. Read-only and per-table grants enforced.
+> **Status:** v0.3.0 — validation is **token-based**, not substring matching. Statements are tokenized (comments removed, string/dollar-quoted literals collapsed to a sentinel) before any rule runs, so keywords hidden in literals, doubled whitespace, `over(` without a space, comma-joined tables, and stacked `; DROP` no longer slip through. Per-table **column allowlists** and **row filters** are now enforced (they were loaded but ignored through v0.2). A committed adversarial suite (`tests/run_adversarial_tests.sh`, 13 cases) is the regression gate. Neon HTTP endpoint; six MCP tools.
 
 ---
 
@@ -14,7 +14,7 @@ Most Postgres MCP servers expose one tool: `query(sql)`. The agent gets full rea
 
 `kryos-mcp-pg` flips that. The connection role still matters, but a JSON grant file in front of it says:
 
-- `users` — read only, columns `id, email, name, created_at`, auto-injected `WHERE deleted_at IS NULL`
+- `users` — read only, columns `id, email, name, created_at`, required `WHERE deleted_at IS NULL` (a read is refused unless it includes the filter; enforced by verifying the predicate is present, never silently rewritten)
 - `orders` — read + write, all columns
 - `audit_log` — append only (writes allowed, reads refused)
 - everything else — invisible
@@ -133,11 +133,11 @@ See [`grants.example.json`](grants.example.json) for the full schema. Minimum:
 
 Field reference:
 - `tables[].actions` — any subset of `["read", "write", "ddl"]`. `read` = SELECT/EXPLAIN/WITH. `write` = INSERT/UPDATE/DELETE/MERGE. `ddl` covered separately by `ddl.allowed`.
-- `tables[].columns` — informational for v0.1; not yet enforced at the column level (planned for v0.2).
-- `tables[].filter` — informational for v0.1; not yet auto-injected (planned for v0.2).
-- `shape.deny_select_star` — refuses any `SELECT *`.
-- `shape.require_where_on_writes` — refuses bare `UPDATE`/`DELETE`.
-- `shape.allow_window` — refuses window-function clauses (`OVER (...)`).
+- `tables[].columns` — **enforced (v0.3)**. `["*"]` allows any column; an explicit list restricts a SELECT to those columns. Qualified columns (`u.id`) are attributed to their table via alias resolution; an unqualified column in a multi-table SELECT that touches a restricted table is refused as ambiguous — qualify it.
+- `tables[].filter` — **enforced (v0.3)** as a required predicate. A read of a filtered table is refused unless the query includes the filter (verified as a token subsequence). Not silently injected: the caller sees exactly what must be present.
+- `shape.deny_select_star` — refuses any column-expansion `*` (`SELECT *`, `t.*`), while allowing `count(*)`. Tokenized, so `SELECT  *` (extra whitespace) cannot bypass it.
+- `shape.require_where_on_writes` — refuses bare `UPDATE`/`DELETE`. Checks for a real `WHERE` keyword token, so `where` inside a string literal does not satisfy it.
+- `shape.allow_window` — refuses window-function clauses (`OVER (...)`). Tokenized, so `over(` without a space is still caught.
 
 ---
 
@@ -145,7 +145,7 @@ Field reference:
 
 1. **Startup:** load grants JSON, parse `DATABASE_URL`, extract Neon hostname for the HTTP endpoint.
 2. **MCP loop:** read JSON-RPC 2.0 messages from stdin, dispatch by method.
-3. **`tools/call query`:** classify SQL action (`read`/`write`/`ddl`), check shape gates, scan referenced tables against the grant list, refuse on first violation.
+3. **`tools/call query`:** tokenize the statement (drop comments, collapse literals), reject multiple statements, classify the action (`read`/`write`/`ddl`), check shape gates, resolve referenced tables and their aliases, then enforce table grants, column allowlists, and required filters on the token stream — refusing on the first violation.
 4. **If allowed:** POST to `https://<host>/sql` with `Neon-Connection-String` header and `{query, params}` body. Format response as a markdown table.
 
 The Kryos `@capabilities(net, env, io)` annotation on `main()` means the compiler proves at compile time that this binary cannot use any other capability — no filesystem writes, no shell-out, no FFI. That's the language-level guarantee. The grant file layers per-table policy on top.
