@@ -1,8 +1,13 @@
-// kryos-mcp-pg — Capability-gated Postgres MCP server in pure Kryos.
+// kryos-mcp-pg — Capability-gated, backend-agnostic SQL MCP server in pure Kryos.
 //
-// Speaks JSON-RPC 2.0 over stdio per the MCP spec. Postgres execution is
-// done via Neon's HTTP serverless endpoint (POST /sql), so it works with
-// any Neon database without a wire-protocol implementation.
+// Speaks JSON-RPC 2.0 over stdio per the MCP spec. Everything above the
+// execution layer (the tokenizing validator, grants, column allowlists, row
+// filters, and the tools) is backend-independent. The execution backend is
+// chosen by the DATABASE_URL scheme:
+//   sqlite:<path>                 -> native std::db  ($0, no network, cap: db)
+//   postgresql:// | postgres://   -> Neon HTTP /sql  (hosted, cap: net)
+// Adding an engine is one adapter (see backend_execute / backend_explain);
+// nothing else changes.
 //
 // Per-table grants are loaded from a JSON config file at startup and
 // every SQL statement is validated against them BEFORE the request hits
@@ -1151,6 +1156,34 @@ fn format_response(resp: i64) -> str {
 // MCP tools
 // ===========================================================================
 
+// ===========================================================================
+// Backend-agnostic execution dispatch
+//
+// Every tool routes validated SQL through here; nothing above the execution
+// layer knows or cares which engine runs it. A backend is a (URL scheme ->
+// executor) pair, detected once in load_grants:
+//   sqlite:<path>                     -> native std::db  (capability: db, no net)
+//   postgresql:// | postgres://       -> Neon HTTP /sql  (capability: net)
+// Adding an engine = detect its scheme in load_grants and add one branch here
+// plus its executor. The validator, grants, and tools stay untouched.
+// ===========================================================================
+
+@capabilities(net, db)
+fn backend_execute(sql: str, params_node: i64) -> str {
+  if BACKEND == "sqlite" {
+    return sqlite_run(sql)
+  }
+  return format_response(neon_query(sql, params_node))
+}
+
+@capabilities(net, db)
+fn backend_explain(sql: str) -> str {
+  if BACKEND == "sqlite" {
+    return sqlite_run("EXPLAIN QUERY PLAN " + sql)
+  }
+  return format_response(neon_query("EXPLAIN " + sql, 0))
+}
+
 fn tool_query(args_node: i64) -> i64 {
   if GRANTS_LOADED == 0 {
     return err_content("grants not loaded: " + LOAD_ERROR)
@@ -1166,12 +1199,8 @@ fn tool_query(args_node: i64) -> i64 {
     return err_content("REFUSED by grants: " + refusal)
   }
   audit("query", sql, "allowed", "")
-  if BACKEND == "sqlite" {
-    return text_content(sqlite_run(sql))
-  }
   let params_n: i64 = json_get(args_node, "params")
-  let resp: i64 = neon_query(sql, params_n)
-  return text_content(format_response(resp))
+  return text_content(backend_execute(sql, params_n))
 }
 
 fn tool_explain(args_node: i64) -> i64 {
@@ -1189,12 +1218,7 @@ fn tool_explain(args_node: i64) -> i64 {
     return err_content("REFUSED by grants: " + refusal)
   }
   audit("explain", sql, "allowed", "")
-  let wrapped: str = "EXPLAIN " + sql
-  if BACKEND == "sqlite" {
-    return text_content(sqlite_run("EXPLAIN QUERY PLAN " + sql))
-  }
-  let resp: i64 = neon_query(wrapped, 0)
-  return text_content(format_response(resp))
+  return text_content(backend_explain(sql))
 }
 
 fn tool_dry_run(args_node: i64) -> i64 {
@@ -1260,9 +1284,14 @@ fn tool_schema(args_node: i64) -> i64 {
   if dot >= 0 {
     schema_part = substr(raw, 0, dot)
   }
+  // Column introspection is dialect-specific: SQLite uses pragma_table_info,
+  // Postgres uses information_schema.
+  if BACKEND == "sqlite" {
+    let sql: str = "SELECT name, type FROM pragma_table_info('" + bare + "')"
+    return text_content(sqlite_run(sql))
+  }
   let sql: str = "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = '" + schema_part + "' AND table_name = '" + bare + "' ORDER BY ordinal_position"
-  let resp: i64 = neon_query(sql, 0)
-  return text_content(format_response(resp))
+  return text_content(format_response(neon_query(sql, 0)))
 }
 
 fn tool_grants(args_node: i64) -> i64 {

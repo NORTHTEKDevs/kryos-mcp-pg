@@ -198,22 +198,47 @@ When `KRYOS_MCP_PG_AUDIT_LOG=/path/to/audit.jsonl` is set, every `query` / `expl
 
 Allowed and refused calls both get logged. Unset to disable. (See [docs/ROADMAP.md](docs/ROADMAP.md) for what's landed on `v0.2-dev`.)
 
+## Backends (database-agnostic)
+
+Everything above the execution layer — the tokenizing validator, grants, column
+allowlists, row filters, and all six tools — is **backend-independent**. The
+engine is chosen once, by the `DATABASE_URL` scheme:
+
+| Scheme | Engine | Capability | Cost | Needs |
+|---|---|---|---|---|
+| `sqlite:./data.db` | native `std::db` | `db` (no `net`) | $0 | nothing — local file |
+| `sqlite::memory:` | native `std::db` | `db` (no `net`) | $0 | nothing — ephemeral |
+| `postgresql://…` / `postgres://…` | Neon HTTP `/sql` | `net` | Neon free tier ($0) | a Neon URL |
+
+**Adding an engine** is one adapter: detect its URL scheme in `load_grants`
+(set `BACKEND`), then add a branch to `backend_execute` / `backend_explain` with
+its executor. Any HTTP-SQL provider (Turso, Cloudflare D1, PlanetScale, a custom
+gateway) fits this shape — the validator and tools never change.
+
+**Honest boundary:** Kryos can natively drive SQLite (any local file) and
+HTTP-SQL endpoints. It does **not** yet speak the raw Postgres/MySQL wire
+protocol (TCP:5432), so a self-hosted Postgres server needs an HTTP gateway in
+front, or a future Kryos wire driver. The `db`-capability SQLite path is the
+strongest posture: the compiler proves that build cannot touch the network.
+
 ## Tests
 
 ```bash
-bash tests/run_tests.sh
+bash tests/run_tests.sh              # 32 — grant/shape/action assertions
+bash tests/run_v02_tests.sh          # 14 — schema-qualified matching + audit log
+bash tests/run_adversarial_tests.sh  # 18 — token-validator bypass regression gate
 ```
 
-32 assertions covering all 7 README scenarios + 9 edge cases (joins onto ungranted tables, UPDATE on read-only tables, window functions, EXPLAIN classification, lowercase SQL, unknown actions like `VACUUM`) + tool-level error handling. Uses the `dry_run` tool throughout — no Neon round-trips, no DB needed. The fake `DATABASE_URL` in the script never connects.
+All three run the `dry_run` tool against a fake `DATABASE_URL` — no round-trips,
+no DB needed. The adversarial suite (`run_adversarial_tests.sh`) prefers the
+compiled `./main.exe` if present, else the JIT from source.
 
-## Limitations (v0.1)
+## Limitations
 
-- **Neon-only.** Uses Neon's HTTP serverless endpoint. Plain Postgres needs the wire protocol — planned for v0.2.
-- **Column allowlists are informational.** Listed in grants but not yet enforced. SELECT specifics still go to Postgres as written.
-- **Auto-injected WHERE filters are informational.** Listed in grants but not yet rewritten into the query.
-- **SQL inspection is regex-based.** Not a real parser. Conservative: anything ambiguous is refused.
-- **No prepared-statement caching.** Every query is a fresh HTTP POST.
-- **No transaction support yet.** Single-statement queries only.
+- **No raw wire protocol.** SQLite (local) and HTTP-SQL (Neon) only; TCP Postgres/MySQL needs a gateway or a future driver.
+- **SQLite result headers are positional** (`c0..cN`) — `std::db` has no column-name accessor yet.
+- **SQLite params are inlined**, not bound — the `params` argument is honored on the Neon path only for now.
+- **No prepared-statement caching / no multi-statement transactions.** One statement per call (stacked statements are refused by design).
 
 ---
 
