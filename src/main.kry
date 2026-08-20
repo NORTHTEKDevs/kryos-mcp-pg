@@ -66,6 +66,7 @@ let mut AUDIT_LOG_PATH: str = ""
 // String / collection helpers (Kryos lacks index_of / env_get_or builtins)
 // ===========================================================================
 
+@capabilities(process)
 fn env_or(name: str, default: str) -> str {
   let v: str = env_get(name)
   if len(v) == 0 {
@@ -264,7 +265,7 @@ fn grant_table_summary() -> str {
   return out
 }
 
-@capabilities(io, env)
+@capabilities(io, process)
 fn load_grants() -> i64 {
   let path: str = env_or("KRYOS_MCP_PG_GRANTS", "grants.json")
   if file_exists(path) == 0 {
@@ -1184,6 +1185,7 @@ fn backend_explain(sql: str) -> str {
   return format_response(neon_query("EXPLAIN " + sql, 0))
 }
 
+@capabilities(io, time, db, net)
 fn tool_query(args_node: i64) -> i64 {
   if GRANTS_LOADED == 0 {
     return err_content("grants not loaded: " + LOAD_ERROR)
@@ -1203,6 +1205,7 @@ fn tool_query(args_node: i64) -> i64 {
   return text_content(backend_execute(sql, params_n))
 }
 
+@capabilities(io, time, db, net)
 fn tool_explain(args_node: i64) -> i64 {
   if GRANTS_LOADED == 0 {
     return err_content("grants not loaded: " + LOAD_ERROR)
@@ -1221,6 +1224,7 @@ fn tool_explain(args_node: i64) -> i64 {
   return text_content(backend_explain(sql))
 }
 
+@capabilities(io, time)
 fn tool_dry_run(args_node: i64) -> i64 {
   if GRANTS_LOADED == 0 {
     return err_content("grants not loaded: " + LOAD_ERROR)
@@ -1257,6 +1261,7 @@ fn tool_tables(args_node: i64) -> i64 {
   return text_content(out)
 }
 
+@capabilities(db, net)
 fn tool_schema(args_node: i64) -> i64 {
   if GRANTS_LOADED == 0 {
     return err_content("grants not loaded: " + LOAD_ERROR)
@@ -1374,6 +1379,7 @@ fn list_tools_result() -> i64 {
   return json_object(["tools"], [json_array(tools)])
 }
 
+@capabilities(io, time, db, net)
 fn call_tool(name: str, args_node: i64) -> i64 {
   if name == "query" {
     return tool_query(args_node)
@@ -1400,6 +1406,7 @@ fn call_tool(name: str, args_node: i64) -> i64 {
 // JSON-RPC dispatch
 // ===========================================================================
 
+@capabilities(io, time, db, net)
 fn handle_message(line: str) -> str {
   let req: i64 = json_parse(line)
   if req <= 0 {
@@ -1462,7 +1469,7 @@ fn handle_message(line: str) -> str {
 // Main
 // ===========================================================================
 
-@capabilities(net, env, io, time, db)
+@capabilities(net, process, io, time, db)
 fn main() {
   let ok: i64 = load_grants()
   if ok == 0 {

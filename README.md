@@ -170,7 +170,7 @@ Field reference:
 3. **`tools/call query`:** tokenize the statement (drop comments, collapse literals), reject multiple statements, classify the action (`read`/`write`/`ddl`), check shape gates, resolve referenced tables and their aliases, then enforce table grants, column allowlists, and required filters on the token stream — refusing on the first violation.
 4. **If allowed:** POST to `https://<host>/sql` with `Neon-Connection-String` header and `{query, params}` body. Format response as a markdown table.
 
-The Kryos `@capabilities(net, env, io)` annotation on `main()` means the compiler proves at compile time that this binary cannot use any other capability — no filesystem writes, no shell-out, no FFI. That's the language-level guarantee. The grant file layers per-table policy on top.
+The Kryos `@capabilities(net, process, io, time, db)` annotation on `main()` means the compiler proves at compile time that this binary cannot use any other capability — no shell-out, no FFI. `process` (not `env`) is what gates `env_get`/`env_or` reads of `DATABASE_URL` etc., since reading the environment can exfiltrate secrets. That's the language-level guarantee. The grant file layers per-table policy on top.
 
 ---
 
@@ -178,7 +178,7 @@ The Kryos `@capabilities(net, env, io)` annotation on `main()` means the compile
 
 | Check | Enforced at |
 |---|---|
-| Process can use net + env + io and nothing else | **Compile time** (Kryos `@capabilities`) |
+| Process can use net + process (env reads) + io + time + db and nothing else | **Compile time** (Kryos `@capabilities`) |
 | SQL action allowed for table | Runtime (this server) |
 | Shape gates (no SELECT *, WHERE on writes, etc.) | Runtime (this server) |
 | Statement timeout, max rows, max query bytes | Runtime (this server) |
@@ -246,7 +246,7 @@ compiled `./main.exe` if present, else the JIT from source.
 
 Three reasons this is built in [Kryos](https://github.com/NORTHTEKDevs/kryos-lang) and not TypeScript:
 
-1. **Compile-time capability proofs.** `@capabilities(net, env, io)` is checked by the compiler. There is no path through the binary that opens a file or shells out, even if a future commit adds one — it would fail to compile.
+1. **Compile-time capability proofs.** `@capabilities(net, process, io, time, db)` is checked by the compiler. There is no path through the binary that shells out or does FFI, even if a future commit adds one — it would fail to compile.
 2. **Single static binary.** No Node runtime, no `npm install`, no version drift. ~few MB executable, drop into a Docker image, run.
 3. **The MCP server pattern in Kryos is short.** ~700 lines of pure Kryos for the whole thing. Easy to audit, easy to fork.
 
