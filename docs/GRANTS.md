@@ -117,7 +117,7 @@ The validator runs **before** any HTTP request to Neon. The Postgres role is the
 
 - `tables[].columns` is informational. The list is exposed by the `tables` tool and is meant for agent-side hinting; column-level validation is v0.2.
 - `tables[].filter` is informational. It's exposed but not auto-injected. v0.2 will rewrite the query.
-- Schema qualification (e.g. `analytics.events`) is not yet enforced — the validator matches on the unqualified name. If you have two tables with the same name in different schemas, the grant applies to both.
+- Schema qualification (e.g. `analytics.events`) is enforced as of v0.2. Bare references resolve to `public`; qualified references must match exactly. A grant for `analytics.events` does NOT match a bare `events` reference. (v0.1 had this as a gap.)
 - The validator is regex-based, not a full SQL parser. It's deliberately conservative: anything ambiguous is refused.
 
 See [SECURITY.md](SECURITY.md) for the threat model these checks are designed against.

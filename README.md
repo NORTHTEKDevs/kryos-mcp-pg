@@ -1,10 +1,10 @@
 # kryos-mcp-pg
 
-A capability-gated Postgres MCP server, written in [Kryos](https://github.com/NORTHTEKDevs/kryos-lang).
+A capability-gated SQL MCP server, written in [Kryos](https://github.com/NORTHTEKDevs/kryos-lang). Runs against **local SQLite ($0, no network)** or **hosted Postgres (Neon HTTP)** — same grants, same validator, one binary.
 
 Every SQL statement is validated against a grant config before it touches the wire. If a grant doesn't permit it, the tool call returns a refusal and Postgres never sees the query. No prompt instructions to ignore. No "please don't drop the table." A small, auditable rule file decides what an LLM is allowed to do.
 
-> **Status:** v0.1.0 — works end-to-end against any Neon Postgres database via Neon's HTTP serverless endpoint. Six MCP tools. Read-only and per-table grants enforced.
+> **Status:** v0.3.0 — validation is **token-based**, not substring matching. Statements are tokenized (comments removed, string/dollar-quoted literals collapsed to a sentinel) before any rule runs, so keywords hidden in literals, doubled whitespace, `over(` without a space, comma-joined tables, and stacked `; DROP` no longer slip through. Per-table **column allowlists** and **row filters** are now enforced (they were loaded but ignored through v0.2). A committed adversarial suite (`tests/run_adversarial_tests.sh`, 13 cases) is the regression gate. Neon HTTP endpoint; six MCP tools.
 
 ---
 
@@ -14,7 +14,7 @@ Most Postgres MCP servers expose one tool: `query(sql)`. The agent gets full rea
 
 `kryos-mcp-pg` flips that. The connection role still matters, but a JSON grant file in front of it says:
 
-- `users` — read only, columns `id, email, name, created_at`, auto-injected `WHERE deleted_at IS NULL`
+- `users` — read only, columns `id, email, name, created_at`, required `WHERE deleted_at IS NULL` (a read is refused unless it includes the filter; enforced by verifying the predicate is present, never silently rewritten)
 - `orders` — read + write, all columns
 - `audit_log` — append only (writes allowed, reads refused)
 - everything else — invisible
@@ -70,7 +70,17 @@ cd kryos-mcp-pg
 cp grants.example.json grants.json     # edit for your database
 ```
 
-Run as an MCP server:
+Run as an MCP server. Two backends, selected by the `DATABASE_URL` scheme:
+
+**Local SQLite — $0, no network, no credential** (the `db` capability, never `net`):
+
+```bash
+DATABASE_URL=sqlite:./data.db \
+  KRYOS_MCP_PG_GRANTS=./grants.json \
+  kryos run src/main.kry
+```
+
+**Hosted Postgres over Neon's HTTP endpoint:**
 
 ```bash
 DATABASE_URL=postgresql://user:pass@ep-foo-bar.region.aws.neon.tech/db \
@@ -78,28 +88,38 @@ DATABASE_URL=postgresql://user:pass@ep-foo-bar.region.aws.neon.tech/db \
   kryos run src/main.kry
 ```
 
-Or build a release binary:
+The grant file, the tokenizing validator, column allowlists and row filters are
+**identical across both backends** — only the execution layer differs. The SQLite
+backend is the cheapest way to run this and the strongest security posture: a
+governed-SQL server the compiler proves cannot touch the network.
+
+Or ship it as a **single standalone binary** — no toolchain install on the target:
 
 ```bash
-kryos build --release
-DATABASE_URL=... KRYOS_MCP_PG_GRANTS=./grants.json ./kryos-mcp-pg
+kryos build --release src/main.kry     # produces main.exe (~7 MB, LLVM AOT)
+DATABASE_URL=... KRYOS_MCP_PG_GRANTS=./grants.json ./main.exe
 ```
+
+> **v0.3 note:** the LLVM AOT release build now works end-to-end — JSON and `http_request` builtins are linked, and the standalone binary passes the full validator suite (verified byte-identical to the Cranelift JIT). The earlier v0.1 limitation (release build missing those builtins) is resolved.
 
 ### Claude Desktop config
 
 ```json
 {
   "mcpServers": {
-    "kryos-pg": {
-      "command": "/path/to/kryos-mcp-pg",
+    "pg": {
+      "command": "kryos",
+      "args": ["run", "/abs/path/to/kryos-mcp-pg/src/main.kry"],
       "env": {
         "DATABASE_URL": "postgresql://...",
-        "KRYOS_MCP_PG_GRANTS": "/path/to/grants.json"
+        "KRYOS_MCP_PG_GRANTS": "/abs/path/to/grants.json"
       }
     }
   }
 }
 ```
+
+See [`examples/claude-desktop-config.json`](examples/claude-desktop-config.json) for a copy-pasteable version.
 
 ---
 
@@ -135,11 +155,11 @@ See [`grants.example.json`](grants.example.json) for the full schema. Minimum:
 
 Field reference:
 - `tables[].actions` — any subset of `["read", "write", "ddl"]`. `read` = SELECT/EXPLAIN/WITH. `write` = INSERT/UPDATE/DELETE/MERGE. `ddl` covered separately by `ddl.allowed`.
-- `tables[].columns` — informational for v0.1; not yet enforced at the column level (planned for v0.2).
-- `tables[].filter` — informational for v0.1; not yet auto-injected (planned for v0.2).
-- `shape.deny_select_star` — refuses any `SELECT *`.
-- `shape.require_where_on_writes` — refuses bare `UPDATE`/`DELETE`.
-- `shape.allow_window` — refuses window-function clauses (`OVER (...)`).
+- `tables[].columns` — **enforced (v0.3)**. `["*"]` allows any column; an explicit list restricts a SELECT to those columns. Qualified columns (`u.id`) are attributed to their table via alias resolution; an unqualified column in a multi-table SELECT that touches a restricted table is refused as ambiguous — qualify it.
+- `tables[].filter` — **enforced (v0.3)** as a required predicate. A read of a filtered table is refused unless the query includes the filter (verified as a token subsequence). Not silently injected: the caller sees exactly what must be present.
+- `shape.deny_select_star` — refuses any column-expansion `*` (`SELECT *`, `t.*`), while allowing `count(*)`. Tokenized, so `SELECT  *` (extra whitespace) cannot bypass it.
+- `shape.require_where_on_writes` — refuses bare `UPDATE`/`DELETE`. Checks for a real `WHERE` keyword token, so `where` inside a string literal does not satisfy it.
+- `shape.allow_window` — refuses window-function clauses (`OVER (...)`). Tokenized, so `over(` without a space is still caught.
 
 ---
 
@@ -147,10 +167,10 @@ Field reference:
 
 1. **Startup:** load grants JSON, parse `DATABASE_URL`, extract Neon hostname for the HTTP endpoint.
 2. **MCP loop:** read JSON-RPC 2.0 messages from stdin, dispatch by method.
-3. **`tools/call query`:** classify SQL action (`read`/`write`/`ddl`), check shape gates, scan referenced tables against the grant list, refuse on first violation.
+3. **`tools/call query`:** tokenize the statement (drop comments, collapse literals), reject multiple statements, classify the action (`read`/`write`/`ddl`), check shape gates, resolve referenced tables and their aliases, then enforce table grants, column allowlists, and required filters on the token stream — refusing on the first violation.
 4. **If allowed:** POST to `https://<host>/sql` with `Neon-Connection-String` header and `{query, params}` body. Format response as a markdown table.
 
-The Kryos `@capabilities(net, env, io)` annotation on `main()` means the compiler proves at compile time that this binary cannot use any other capability — no filesystem writes, no shell-out, no FFI. That's the language-level guarantee. The grant file layers per-table policy on top.
+The Kryos `@capabilities(net, process, io, time, db)` annotation on `main()` means the compiler proves at compile time that this binary cannot use any other capability — no shell-out, no FFI. `process` (not `env`) is what gates `env_get`/`env_or` reads of `DATABASE_URL` etc., since reading the environment can exfiltrate secrets. That's the language-level guarantee. The grant file layers per-table policy on top.
 
 ---
 
@@ -158,7 +178,7 @@ The Kryos `@capabilities(net, env, io)` annotation on `main()` means the compile
 
 | Check | Enforced at |
 |---|---|
-| Process can use net + env + io and nothing else | **Compile time** (Kryos `@capabilities`) |
+| Process can use net + process (env reads) + io + time + db and nothing else | **Compile time** (Kryos `@capabilities`) |
 | SQL action allowed for table | Runtime (this server) |
 | Shape gates (no SELECT *, WHERE on writes, etc.) | Runtime (this server) |
 | Statement timeout, max rows, max query bytes | Runtime (this server) |
@@ -168,14 +188,57 @@ The runtime grant check fires *before* any SQL hits the network. The Postgres ro
 
 ---
 
-## Limitations (v0.1)
+## Audit log (v0.2-dev)
 
-- **Neon-only.** Uses Neon's HTTP serverless endpoint. Plain Postgres needs the wire protocol — planned for v0.2.
-- **Column allowlists are informational.** Listed in grants but not yet enforced. SELECT specifics still go to Postgres as written.
-- **Auto-injected WHERE filters are informational.** Listed in grants but not yet rewritten into the query.
-- **SQL inspection is regex-based.** Not a real parser. Conservative: anything ambiguous is refused.
-- **No prepared-statement caching.** Every query is a fresh HTTP POST.
-- **No transaction support yet.** Single-statement queries only.
+When `KRYOS_MCP_PG_AUDIT_LOG=/path/to/audit.jsonl` is set, every `query` / `explain` / `dry_run` call appends a JSONL line:
+
+```json
+{"ts":1747259820,"tool":"dry_run","verdict":"refused","reason":"DDL refused: ddl.allowed = false in grants","sql":"DROP TABLE users"}
+```
+
+Allowed and refused calls both get logged. Unset to disable. (See [docs/ROADMAP.md](docs/ROADMAP.md) for what's landed on `v0.2-dev`.)
+
+## Backends (database-agnostic)
+
+Everything above the execution layer — the tokenizing validator, grants, column
+allowlists, row filters, and all six tools — is **backend-independent**. The
+engine is chosen once, by the `DATABASE_URL` scheme:
+
+| Scheme | Engine | Capability | Cost | Needs |
+|---|---|---|---|---|
+| `sqlite:./data.db` | native `std::db` | `db` (no `net`) | $0 | nothing — local file |
+| `sqlite::memory:` | native `std::db` | `db` (no `net`) | $0 | nothing — ephemeral |
+| `postgresql://…` / `postgres://…` | Neon HTTP `/sql` | `net` | Neon free tier ($0) | a Neon URL |
+
+**Adding an engine** is one adapter: detect its URL scheme in `load_grants`
+(set `BACKEND`), then add a branch to `backend_execute` / `backend_explain` with
+its executor. Any HTTP-SQL provider (Turso, Cloudflare D1, PlanetScale, a custom
+gateway) fits this shape — the validator and tools never change.
+
+**Honest boundary:** Kryos can natively drive SQLite (any local file) and
+HTTP-SQL endpoints. It does **not** yet speak the raw Postgres/MySQL wire
+protocol (TCP:5432), so a self-hosted Postgres server needs an HTTP gateway in
+front, or a future Kryos wire driver. The `db`-capability SQLite path is the
+strongest posture: the compiler proves that build cannot touch the network.
+
+## Tests
+
+```bash
+bash tests/run_tests.sh              # 32 — grant/shape/action assertions
+bash tests/run_v02_tests.sh          # 14 — schema-qualified matching + audit log
+bash tests/run_adversarial_tests.sh  # 18 — token-validator bypass regression gate
+```
+
+All three run the `dry_run` tool against a fake `DATABASE_URL` — no round-trips,
+no DB needed. The adversarial suite (`run_adversarial_tests.sh`) prefers the
+compiled `./main.exe` if present, else the JIT from source.
+
+## Limitations
+
+- **No raw wire protocol.** SQLite (local) and HTTP-SQL (Neon) only; TCP Postgres/MySQL needs a gateway or a future driver.
+- **SQLite result headers are positional** (`c0..cN`) — `std::db` has no column-name accessor yet.
+- **SQLite params are inlined**, not bound — the `params` argument is honored on the Neon path only for now.
+- **No prepared-statement caching / no multi-statement transactions.** One statement per call (stacked statements are refused by design).
 
 ---
 
@@ -183,7 +246,7 @@ The runtime grant check fires *before* any SQL hits the network. The Postgres ro
 
 Three reasons this is built in [Kryos](https://github.com/NORTHTEKDevs/kryos-lang) and not TypeScript:
 
-1. **Compile-time capability proofs.** `@capabilities(net, env, io)` is checked by the compiler. There is no path through the binary that opens a file or shells out, even if a future commit adds one — it would fail to compile.
+1. **Compile-time capability proofs.** `@capabilities(net, process, io, time, db)` is checked by the compiler. There is no path through the binary that shells out or does FFI, even if a future commit adds one — it would fail to compile.
 2. **Single static binary.** No Node runtime, no `npm install`, no version drift. ~few MB executable, drop into a Docker image, run.
 3. **The MCP server pattern in Kryos is short.** ~700 lines of pure Kryos for the whole thing. Easy to audit, easy to fork.
 
